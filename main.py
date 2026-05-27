@@ -7,7 +7,8 @@ from enum import Enum
 from pymongo import ReturnDocument
 from typing import Any, Optional
 from datetime import datetime, timedelta, timezone   # ← add timedelta
-import hashlib                                        
+import hashlib                      
+from health import router as health_router           
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
@@ -1574,6 +1575,8 @@ def valid_object_id(id: str) -> ObjectId:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ROUTES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+app.include_router(health_router)   
 
 # ── GET /signals ──────────────────────────────────────────────────────────────
 @app.get("/signals", response_model=PaginatedSignals)
