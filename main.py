@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pymongo import ReturnDocument
 from typing import Any, Optional
-
+from datetime import datetime, timedelta, timezone   # ← add timedelta
+import hashlib                                        
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
@@ -148,6 +149,32 @@ class ScrapeStatus(BaseModel):
     nextRun:   Optional[str] = None
     message:   str
 
+class NotificationCategory(str):
+    """Mirrors the TypeScript union — kept as str so it round-trips cleanly."""
+    HIGH_MATCH   = "High Match Opportunity"
+    TRENDING     = "Trending Opportunity"
+    DEADLINE     = "Deadline Alert"
+    AI_INSIGHT   = "AI Insight Alert"
+    SYSTEM       = "System Activity"
+    QUEUE        = "Queue Reminder"
+ 
+ 
+class NotificationItemModel(BaseModel):
+    id:           str
+    section:      str
+    title:        str
+    context:      str
+    time:         str
+    category:     str
+    priority:     str
+    matchScore:   Optional[int]  = None
+    urgency:      Optional[str]  = None
+    actions:      list[str]
+    signalId:     Optional[str]  = None
+    generatedAt:  str
+    # ── user-persisted state (new in v2) ─────────────────────────────────────
+    isImportant:  bool           = False   # toggled by user, survives regeneration
+    isDismissed:  bool           = False   # soft-delete; restore sets back to False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATABASE
@@ -172,6 +199,11 @@ async def connect_db() -> None:
     await col.create_index("extractionConfidence")
     await col.create_index("status")
     db.signals = col
+    notif_col = db.client[DB_NAME]["notifications"]
+    await notif_col.create_index("section")
+    await notif_col.create_index("priority")
+    await notif_col.create_index("isRead")
+    await notif_col.create_index("generatedAt")
     print(f"✅ MongoDB connected → {DB_NAME}.signals")
 
 
@@ -195,6 +227,153 @@ scrape_state: dict[str, Any] = {
     "last_saved": None,
 }
 
+
+notifications_state: dict[str, Any] = {
+    "running":    False,
+    "last_run":   None,
+    "last_count": None,
+}
+ 
+ 
+def get_notifications_col() -> AsyncIOMotorCollection:
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["notifications"]
+    
+def _notif_id(prefix: str, *parts: str) -> str:
+    """Stable, short, collision-resistant ID for a notification."""
+    raw = f"{prefix}:{'|'.join(str(p) for p in parts)}"
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
+ 
+ 
+def _fmt_time(iso_str: str, now: datetime) -> str:
+    """
+    Format an ISO timestamp as a human-readable relative time string that
+    matches the signal.tsx display:
+      • same day   →  "9:14 AM"
+      • this week  →  "Mon · 4:42 PM"
+      • older      →  "May 20"
+    """
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone()
+        delta    = now - dt
+ 
+        h    = local_dt.hour % 12 or 12
+        mins = local_dt.strftime("%M")
+        ampm = "AM" if local_dt.hour < 12 else "PM"
+        t    = f"{h}:{mins} {ampm}"
+ 
+        if delta.total_seconds() < 0:          # future timestamp guard
+            return t
+        if delta.days == 0:
+            return t
+        if delta.days <= 7:
+            return f"{local_dt.strftime('%a')} · {t}"
+        return local_dt.strftime("%b %d")
+    except Exception:
+        return ""
+ 
+ 
+def _clean(text: str, max_len: int = 200) -> str:
+    """Strip whitespace, collapse newlines, truncate."""
+    return " ".join(text.split())[:max_len].strip()
+ 
+ 
+async def _generate_ai_insight(signals: list[dict], now: datetime) -> dict:
+    """
+    Ask Gemini to generate ONE concise trend insight from the week's aggregate
+    signal data. Falls back to a computed insight if Gemini is unavailable.
+ 
+    Returns {"title": str, "context": str}
+    """
+    # ── Aggregate stats ───────────────────────────────────────────────────────
+    role_counts:     dict[str, int] = {}
+    location_counts: dict[str, int] = {}
+    tag_counts:      dict[str, int] = {}
+    platforms:       set[str]       = set()
+ 
+    for s in signals:
+        rt  = s.get("roleType",  "Software Engineering")
+        loc = s.get("location",  "Unknown")
+        plt = s.get("platform",  "Unknown")
+ 
+        role_counts[rt]     = role_counts.get(rt, 0)     + 1
+        location_counts[loc]= location_counts.get(loc, 0)+ 1
+        platforms.add(plt)
+ 
+        for tag in s.get("skillTags", []):
+            if tag:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+ 
+    top_roles    = sorted(role_counts.items(),     key=lambda x: -x[1])[:5]
+    top_tags     = sorted(tag_counts.items(),      key=lambda x: -x[1])[:6]
+    top_locs     = sorted(location_counts.items(), key=lambda x: -x[1])[:4]
+    remote_frac  = round(
+        (location_counts.get("Remote", 0) + location_counts.get("Nigeria Remote", 0))
+        / max(len(signals), 1) * 100
+    )
+ 
+    stats = {
+        "total_signals_this_week": len(signals),
+        "top_role_types":          top_roles,
+        "top_skill_tags":          top_tags,
+        "top_locations":           top_locs,
+        "platforms":               sorted(platforms),
+        "remote_percentage":       remote_frac,
+    }
+ 
+    prompt = (
+        "You are generating a single concise market-intelligence notification "
+        "for a Nigerian software developer job-tracking app called Signal.\n\n"
+        "From this week's scraped job data, generate ONE insight notification.\n\n"
+        f"DATA:\n{json.dumps(stats, indent=2)}\n\n"
+        "Return ONLY a JSON object — no markdown fences, no commentary:\n"
+        '{\n'
+        '  "title": "Insight headline — max 12 words, present tense, cite a concrete number",\n'
+        '  "context": "1–2 sentences expanding the insight for a Nigerian dev (max 180 chars)"\n'
+        '}\n\n'
+        "Example good titles:\n"
+        '- "React roles up 21% this week across 4 platforms"\n'
+        '- "Remote-first listings dominate — 67% of new opportunities"\n'
+        '- "TypeScript appears in 8 of the top 10 frontend roles this week"'
+    )
+ 
+    try:
+        client, _ = _next_client()
+        resp  = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        raw   = resp.text.strip()
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            raw   = parts[1][4:] if parts[1].startswith("json") else parts[1]
+        data  = json.loads(raw.strip())
+        return {
+            "title":   data.get("title",   ""),
+            "context": data.get("context", ""),
+        }
+    except Exception as e:
+        print(f"  ⚠  AI insight generation failed: {e} — using computed fallback")
+ 
+    # ── Computed fallback (no Gemini needed) ──────────────────────────────────
+    top_role_name, top_role_count = top_roles[0] if top_roles else ("Software Engineering", 0)
+    top_tag_name                  = top_tags[0][0] if top_tags else "React"
+    source_count                  = len(platforms)
+ 
+    return {
+        "title":   (
+            f"{top_role_name} roles led this week — "
+            f"{top_role_count} new listing{'s' if top_role_count != 1 else ''}"
+        ),
+        "context": (
+            f"{top_tag_name} was the most demanded skill across {source_count} "
+            f"source{'s' if source_count != 1 else ''}. "
+            f"{remote_frac}% of this week's opportunities are remote-friendly."
+        ),
+    }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MAPPER  raw item → MongoDB doc → IntelligenceSignal
@@ -948,6 +1127,390 @@ async def run_scrape_pipeline() -> dict[str, int]:
     finally:
         scrape_state["running"] = False
 
+async def generate_notifications_pipeline() -> int:
+    """
+    Analyse the last 7 days of scraped IntelligenceSignal documents and
+    derive NotificationItem records for signal.tsx.
+ 
+    Runs once a week via APScheduler, or on-demand via POST /notifications/generate.
+    Fully replaces the notifications collection on every run — no stale data.
+ 
+    Notification derivation rules
+    ─────────────────────────────────────────────────────────────────────────────
+    section         source                         category
+    ──────────────  ─────────────────────────────  ────────────────────────────
+    Today           addedAt = today                High Match Opportunity  (score ≥ 85)
+    Today           addedAt = today                Deadline Alert          (applicationStatus = "Closing soon")
+    Today           addedAt = today                Trending Opportunity    (score 65–84)
+    Earlier…        addedAt 2–6 days ago           Queue Reminder          (status="new", isIntearested=True)
+    Intelligence…   aggregate analysis             AI Insight Alert        (Gemini-generated)
+    Opportunity…    batch from whole week          High Match Opportunity  (≥3 signals with score ≥ 80)
+    System          last scrape stats              System Activity         (always generated)
+    ─────────────────────────────────────────────────────────────────────────────
+    aiMatchScore mapping (from EXTRACTION_CONFIDENCE_SCORE in main.py):
+      "High"   → 90  →  score ≥ 85  →  High Match Opportunity / high priority
+      "Medium" → 65  →  score 65–84 →  Trending Opportunity   / medium priority
+      "Low"    → 40  →  score < 65  →  (omitted from Today notifications)
+    """
+    if notifications_state["running"]:
+        print("⚠  Notification generation already in progress, skipping.")
+        return 0
+ 
+    notifications_state["running"] = True
+    notif_col = get_notifications_col()
+    sig_col   = get_signals()
+    now       = datetime.now(timezone.utc)
+ 
+    today_start  = now.replace(hour=0,  minute=0,  second=0,  microsecond=0)
+    two_days_ago = now - timedelta(days=2)
+    six_days_ago = now - timedelta(days=6)
+    week_ago     = now - timedelta(days=7)
+ 
+    try:
+        print(f"\n🔔 [{now.strftime('%Y-%m-%d %H:%M:%S')}] Notification generation started")
+ 
+        # ── Fetch all signals from the past 7 days ───────────────────────────
+        recent: list[dict] = await sig_col.find(
+            {"addedAt": {"$gte": week_ago.isoformat()}}
+        ).sort([("aiMatchScore", -1), ("_id", -1)]).to_list(length=600)
+ 
+        print(f"  📊 {len(recent)} signals in the past 7 days")
+ 
+        notifications: list[dict] = []
+        gen_time = now.isoformat()
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 1.  TODAY  —  High Match Opportunity  (score ≥ 85)
+        # ════════════════════════════════════════════════════════════════════
+        today_signals = [
+            s for s in recent
+            if s.get("addedAt", "") >= today_start.isoformat()
+        ]
+ 
+        high_match_today = [
+            s for s in today_signals
+            if s.get("aiMatchScore", 0) >= 85
+        ][:4]   # cap at 4 cards to avoid notification flooding
+ 
+        for sig in high_match_today:
+            role        = sig.get("role",    "tech role")
+            company     = sig.get("company", "a company")
+            score       = sig.get("aiMatchScore", 90)
+            platform    = sig.get("platform", "Signal")
+            skill_align = sig.get("skillAlignment", "")
+            reason      = sig.get("relevanceReason", "")
+            summary     = sig.get("aiSummary", "")
+ 
+            # Context: prefer relevanceReason (most specific), then aiSummary
+            context_text = _clean(reason or summary or f"{role} at {company} on {platform}.", 200)
+ 
+            notifications.append({
+                "_id":         _notif_id("hm", str(sig["_id"])),
+                "id":          _notif_id("hm", str(sig["_id"])),
+                "section":     "Today",
+                "title":       f"New {role} detected — {score}% match",
+                "context":     context_text,
+                "time":        _fmt_time(sig.get("addedAt", ""), now),
+                "category":    "High Match Opportunity",
+                "priority":    "high",
+                "matchScore":  score,
+                "urgency":     None,
+                "actions":     ["Save", "Open", "Mark important", "Mute similar"],
+                "signalId":    str(sig["_id"]),
+                "generatedAt": gen_time,
+                "isRead":      False,
+            })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 2.  TODAY  —  Deadline Alert  (applicationStatus = "Closing soon")
+        # ════════════════════════════════════════════════════════════════════
+        deadline_signals = [
+            s for s in recent
+            if s.get("applicationStatus") == "Closing soon"
+        ][:3]
+ 
+        for sig in deadline_signals:
+            role    = sig.get("role",    "this role")
+            company = sig.get("company", "")
+            added   = sig.get("addedAt", "")
+            summary = _clean(sig.get("aiSummary", ""), 120)
+ 
+            # Compute urgency label from addedAt (best proxy we have for deadline proximity)
+            try:
+                dt       = datetime.fromisoformat(added)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                days_old = (now - dt).days
+                if days_old == 0:
+                    urgency_label = "24h"
+                    urgency_text  = "closes today"
+                elif days_old <= 2:
+                    urgency_label = f"{days_old}d"
+                    urgency_text  = f"closing in {days_old} day{'s' if days_old != 1 else ''}"
+                else:
+                    urgency_label = "soon"
+                    urgency_text  = "closing soon"
+            except Exception:
+                urgency_label = "soon"
+                urgency_text  = "closing soon"
+ 
+            co_str  = f" at {company}" if company and company != "Unknown" else ""
+            context = f"{role}{co_str} is {urgency_text}. {summary}".strip()
+ 
+            notifications.append({
+                "_id":         _notif_id("dl", str(sig["_id"])),
+                "id":          _notif_id("dl", str(sig["_id"])),
+                "section":     "Today",
+                "title":       f"Application deadline approaching — {role}{co_str}",
+                "context":     _clean(context, 200),
+                "time":        _fmt_time(added, now),
+                "category":    "Deadline Alert",
+                "priority":    "high",
+                "matchScore":  None,
+                "urgency":     urgency_label,
+                "actions":     ["Open", "Save", "Dismiss"],
+                "signalId":    str(sig["_id"]),
+                "generatedAt": gen_time,
+                "isRead":      False,
+            })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 3.  TODAY  —  Trending Opportunity  (score 65–84, most skillTags)
+        # ════════════════════════════════════════════════════════════════════
+        trending_today = sorted(
+            [
+                s for s in today_signals
+                if 65 <= s.get("aiMatchScore", 0) < 85
+            ],
+            key=lambda s: len(s.get("skillTags", [])),
+            reverse=True,
+        )[:2]
+ 
+        for sig in trending_today:
+            role     = sig.get("role",     "tech role")
+            tags     = sig.get("skillTags", [])[:3]
+            platform = sig.get("platform", "Signal")
+            tag_str  = ", ".join(tags) if tags else "your primary stack"
+ 
+            notifications.append({
+                "_id":         _notif_id("tr", str(sig["_id"])),
+                "id":          _notif_id("tr", str(sig["_id"])),
+                "section":     "Today",
+                "title":       f"This {role} is gaining attention quickly",
+                "context":     (
+                    f"View velocity is rising among candidates with {tag_str} "
+                    f"in their stack. Role sourced from {platform}."
+                ),
+                "time":        _fmt_time(sig.get("addedAt", ""), now),
+                "category":    "Trending Opportunity",
+                "priority":    "medium",
+                "matchScore":  None,
+                "urgency":     None,
+                "actions":     ["Open", "Mark important", "Mute similar"],
+                "signalId":    str(sig["_id"]),
+                "generatedAt": gen_time,
+                "isRead":      False,
+            })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 4.  EARLIER THIS WEEK  —  Queue Reminder
+        #     Signals the user hasn't acted on in 2–6 days
+        # ════════════════════════════════════════════════════════════════════
+        queue_signals = sorted(
+            [
+                s for s in recent
+                if (
+                    s.get("isIntearested", True)
+                    and s.get("status") == "new"
+                    and six_days_ago.isoformat() <= s.get("addedAt", "") < two_days_ago.isoformat()
+                )
+            ],
+            key=lambda s: s.get("aiMatchScore", 0),
+            reverse=True,
+        )[:3]
+ 
+        for sig in queue_signals:
+            role    = sig.get("role",    "this role")
+            company = sig.get("company", "")
+            added   = sig.get("addedAt", "")
+            mode    = sig.get("roleMode", "Remote")
+            loc     = sig.get("location", "")
+            summary = _clean(sig.get("aiSummary", ""), 120)
+ 
+            try:
+                dt       = datetime.fromisoformat(added)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                days_ago  = (now - dt).days
+                days_str  = f"{days_ago} day{'s' if days_ago != 1 else ''} ago"
+            except Exception:
+                days_str = "recently"
+ 
+            co_str  = f" at {company}" if company and company != "Unknown" else ""
+            loc_str = f", {loc}" if loc and loc not in ("Unknown", "") else ""
+            context = f"{role}{co_str} ({mode}{loc_str}) has not been submitted yet. {summary}".strip()
+ 
+            notifications.append({
+                "_id":         _notif_id("qr", str(sig["_id"])),
+                "id":          _notif_id("qr", str(sig["_id"])),
+                "section":     "Earlier This Week",
+                "title":       f"You marked this role as interested {days_str}",
+                "context":     _clean(context, 200),
+                "time":        _fmt_time(added, now),
+                "category":    "Queue Reminder",
+                "priority":    "medium",
+                "matchScore":  None,
+                "urgency":     None,
+                "actions":     ["Open", "Dismiss"],
+                "signalId":    str(sig["_id"]),
+                "generatedAt": gen_time,
+                "isRead":      False,
+            })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 5.  INTELLIGENCE UPDATES  —  AI Insight Alert  (Gemini-powered)
+        # ════════════════════════════════════════════════════════════════════
+        if recent:
+            insight = await _generate_ai_insight(recent, now)
+            if insight.get("title"):
+                notifications.append({
+                    "_id":         _notif_id("ai", gen_time[:10]),   # one per day
+                    "id":          _notif_id("ai", gen_time[:10]),
+                    "section":     "Intelligence Updates",
+                    "title":       insight["title"],
+                    "context":     insight["context"],
+                    "time":        _fmt_time(gen_time, now),
+                    "category":    "AI Insight Alert",
+                    "priority":    "high",
+                    "matchScore":  None,
+                    "urgency":     None,
+                    "actions":     ["Open", "Save"],
+                    "signalId":    None,
+                    "generatedAt": gen_time,
+                    "isRead":      False,
+                })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 6.  OPPORTUNITY ALERTS  —  Batch high-match summary
+        #     Triggers when ≥ 3 new unread signals scored ≥ 80 this week
+        # ════════════════════════════════════════════════════════════════════
+        batch_signals = [
+            s for s in recent
+            if s.get("aiMatchScore", 0) >= 80 and s.get("status") == "new"
+        ]
+ 
+        if len(batch_signals) >= 3:
+            top_score   = max(s.get("aiMatchScore", 0) for s in batch_signals)
+            # Collect the most common role mode
+            mode_tally: dict[str, int] = {}
+            for s in batch_signals:
+                m = s.get("roleMode", "Remote")
+                mode_tally[m] = mode_tally.get(m, 0) + 1
+            dominant_mode = max(mode_tally, key=mode_tally.get, default="Remote")   # type: ignore[arg-type]
+ 
+            # Deduplicated common skill tags across top 8 signals
+            seen_tags: set[str] = set()
+            common_tags: list[str] = []
+            for s in batch_signals[:8]:
+                for tag in s.get("skillTags", []):
+                    if tag and tag not in seen_tags:
+                        seen_tags.add(tag)
+                        common_tags.append(tag)
+                    if len(common_tags) >= 5:
+                        break
+                if len(common_tags) >= 5:
+                    break
+ 
+            tag_str = ", ".join(common_tags[:4]) if common_tags else "your stack"
+ 
+            notifications.append({
+                "_id":         _notif_id("oa", gen_time[:10]),
+                "id":          _notif_id("oa", gen_time[:10]),
+                "section":     "Opportunity Alerts",
+                "title":       (
+                    f"{len(batch_signals)} new {dominant_mode.lower()} "
+                    f"internship{'s' if len(batch_signals) != 1 else ''} match your profile"
+                ),
+                "context":     (
+                    f"All {len(batch_signals)} roles mention {tag_str} in their scope — "
+                    f"strong alignment with your current stack."
+                ),
+                "time":        _fmt_time(gen_time, now),
+                "category":    "High Match Opportunity",
+                "priority":    "high",
+                "matchScore":  top_score,
+                "urgency":     None,
+                "actions":     ["Open", "Save", "Mute similar"],
+                "signalId":    None,
+                "generatedAt": gen_time,
+                "isRead":      False,
+            })
+ 
+        # ════════════════════════════════════════════════════════════════════
+        # 7.  SYSTEM ACTIVITY  —  Scraper stats
+        # ════════════════════════════════════════════════════════════════════
+        total_week     = len(recent)
+        high_sig_count = len([s for s in recent if s.get("aiMatchScore", 0) >= 80])
+        platforms_seen = sorted({s.get("platform", "Unknown") for s in recent} - {"Unknown"})[:4]
+        platform_str   = ", ".join(platforms_seen) if platforms_seen else "multiple sources"
+        last_run_ts    = scrape_state.get("last_run")
+        last_run_str   = _fmt_time(last_run_ts, now) if last_run_ts else "recently"
+ 
+        notifications.append({
+            "_id":         _notif_id("sys", gen_time[:10]),
+            "id":          _notif_id("sys", gen_time[:10]),
+            "section":     "System Activity",
+            "title":       f"Scanner ingested {total_week} new opportunities this week",
+            "context":     (
+                f"Sources: {platform_str}. "
+                f"{high_sig_count} filtered as potential high-signal matches for your profile. "
+                f"Last scan: {last_run_str}."
+            ),
+            "time":        _fmt_time(gen_time, now),
+            "category":    "System Activity",
+            "priority":    "low",
+            "matchScore":  None,
+            "urgency":     None,
+            "actions":     ["Dismiss"],
+            "signalId":    None,
+            "generatedAt": gen_time,
+            "isRead":      False,
+        })
+ 
+        # ── Persist: drop stale, insert fresh ────────────────────────────────
+        important_cursor = notif_col.find(
+            {"isImportant": True},
+            {"id": 1, "_id": 0},
+        )
+        important_ids: set[str] = {
+            doc["id"] async for doc in important_cursor
+        }
+ 
+        # 2. Wipe old notifications
+        await notif_col.delete_many({})
+ 
+        # 3. Re-apply isImportant to any notification whose ID survived regen
+        if important_ids:
+            for notif in notifications:
+                if notif["id"] in important_ids:
+                    notif["isImportant"] = True
+ 
+        # 4. Insert fresh batch
+        if notifications:
+            await notif_col.insert_many(notifications)
+
+        if notifications:
+            await notif_col.insert_many(notifications)
+ 
+        notifications_state["last_run"]   = gen_time
+        notifications_state["last_count"] = len(notifications)
+ 
+        print(f"✅ Notifications generated — {len(notifications)} items written\n")
+        return len(notifications)
+ 
+    finally:
+        notifications_state["running"] = False
+ 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # APP + SCHEDULER
@@ -966,7 +1529,19 @@ async def lifespan(app: FastAPI):
         id="daily_scrape",
         replace_existing=True,
     )
+    scheduler.add_job(
+        generate_notifications_pipeline,
+        trigger="cron",
+        day_of_week="sun",   # every Sunday — one day after Saturday's big scrape window
+        hour=6,
+        minute=0,
+        id="weekly_notifications",
+        replace_existing=True,
+    )
     scheduler.start()
+    notif_next = scheduler.get_job("weekly_notifications").next_run_time
+    print(f"🔔 Notification cron — next run: {notif_next.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    
     next_run = scheduler.get_job("daily_scrape").next_run_time
     print(f"⏰ Cron scheduled — next run: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     yield
@@ -1175,6 +1750,162 @@ async def meta():
     tag_docs        = await col.aggregate(pipeline).to_list(length=20)
     results["topSkillTags"] = [d["_id"] for d in tag_docs]
     return results
+
+@app.get("/notifications", response_model=list[NotificationItemModel])
+async def get_notifications_route(
+    section:           Optional[str]  = Query(default=None),
+    priority:          Optional[str]  = Query(default=None),
+    category:          Optional[str]  = Query(default=None),
+    include_dismissed: bool           = Query(default=False,
+        description="Pass true to include dismissed notifications (needed for restore)"),
+):
+    """
+    Returns notification items ordered by section priority then recency.
+ 
+    By default (include_dismissed=false) only active notifications are returned —
+    this is what the feed renders.
+ 
+    Pass include_dismissed=true to get ALL notifications including dismissed ones;
+    the hook uses this so it can show the 'Restore N dismissed' count and flip
+    them back locally without an extra round-trip.
+    """
+    SECTION_RANK = {
+        "Today":                0,
+        "Earlier This Week":    1,
+        "Intelligence Updates": 2,
+        "Opportunity Alerts":   3,
+        "System Activity":      4,
+    }
+    col   = get_notifications_col()
+    query: dict[str, Any] = {}
+ 
+    if not include_dismissed:
+        query["isDismissed"] = False     # ← only change from v1
+ 
+    if section:   query["section"]  = section
+    if priority:  query["priority"] = priority
+    if category:  query["category"] = category
+ 
+    docs = await col.find(query).to_list(length=500)
+ 
+    docs.sort(key=lambda d: (
+        SECTION_RANK.get(d.get("section", ""), 99),
+        d.get("generatedAt", ""),
+    ))
+ 
+    result: list[NotificationItemModel] = []
+    for doc in docs:
+        doc["id"] = str(doc.get("id") or doc["_id"])
+        doc.pop("_id", None)
+        try:
+            result.append(NotificationItemModel(**doc))
+        except Exception as e:
+            print(f"  ⚠  Skipping malformed notification: {e}")
+    return result
+
+@app.patch("/notifications/{notif_id}/important")
+async def toggle_notification_important(notif_id: str):
+    """
+    Toggles isImportant on a notification.
+    The hook calls this after the optimistic local update — fire and forget.
+    """
+    col = get_notifications_col()
+ 
+    # Read current value then flip it
+    doc = await col.find_one({"id": notif_id}, {"isImportant": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+ 
+    new_value = not doc.get("isImportant", False)
+    await col.update_one(
+        {"id": notif_id},
+        {"$set": {"isImportant": new_value}},
+    )
+    return {"success": True, "id": notif_id, "isImportant": new_value}
+
+@app.patch("/notifications/{notif_id}/dismiss")
+async def dismiss_notification(notif_id: str):
+    """
+    Soft-deletes a notification by setting isDismissed=True.
+    The item stays in the DB so the 'restore dismissed' feature works.
+ 
+    Why soft delete instead of the existing DELETE route:
+      DELETE = permanent, can't restore.
+      PATCH /dismiss = reversible, restore flips it back.
+    """
+    col = get_notifications_col()
+    result = await col.update_one(
+        {"id": notif_id},
+        {"$set": {"isDismissed": True}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+    return {"success": True, "id": notif_id, "isDismissed": True} 
+
+@app.post("/notifications/restore-dismissed")
+async def restore_dismissed_notifications():
+    """
+    Sets isDismissed=False on all notifications.
+    Called when the user taps 'Restore N dismissed'.
+    """
+    col    = get_notifications_col()
+    result = await col.update_many(
+        {"isDismissed": True},
+        {"$set": {"isDismissed": False}},
+    )
+    return {"success": True, "restored": result.modified_count}
+
+# ── GET /notifications/status ─────────────────────────────────────────────────
+@app.get("/notifications/status")
+async def notifications_status():
+    job      = scheduler.get_job("weekly_notifications")
+    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    return {
+        "running":    notifications_state["running"],
+        "lastRun":    notifications_state["last_run"],
+        "lastCount":  notifications_state["last_count"],
+        "nextRun":    next_run,
+        "message": (
+            "Generation in progress..."
+            if notifications_state["running"]
+            else f"Next scheduled run: {next_run or 'unknown'}"
+        ),
+    }
+ 
+ 
+# ── POST /notifications/generate ─────────────────────────────────────────────
+@app.post("/notifications/generate")
+async def force_generate_notifications():
+    """Force-trigger the notification pipeline outside of the weekly schedule."""
+    count = await generate_notifications_pipeline()
+    return {
+        "message": "Notification generation complete.",
+        "count":   count,
+    }
+ 
+ 
+# ── PATCH /notifications/{id}/read ───────────────────────────────────────────
+@app.patch("/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str):
+    col = get_notifications_col()
+    await col.update_one({"id": notif_id}, {"$set": {"isRead": True}})
+    return {"success": True, "id": notif_id}
+ 
+ 
+# ── PATCH /notifications/read-all ────────────────────────────────────────────
+@app.patch("/notifications/read-all")
+async def mark_all_notifications_read():
+    col    = get_notifications_col()
+    result = await col.update_many({}, {"$set": {"isRead": True}})
+    return {"success": True, "updated": result.modified_count}
+ 
+ 
+# ── DELETE /notifications/{id} ────────────────────────────────────────────────
+@app.delete("/notifications/{notif_id}")
+async def delete_notification(notif_id: str):
+    col = get_notifications_col()
+    await col.delete_one({"id": notif_id})
+    return {"success": True, "id": notif_id}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
