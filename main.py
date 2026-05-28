@@ -523,8 +523,8 @@ ROLE_KEYWORDS = [
 ]
 
 TELEGRAM_CHANNELS = [
-    "jobnetworkng", "Freshersjobsupdates", "ingressive4good",
-    "techies_in_nigeria", "nigeriatechjobs", "lagostechjobs",
+    "jobnetworkng", "remotejobss", "ingressive4good",
+    "jbtoday", "nigeriatechjobs", "lagostechjobs",
     "techJobsNG", "devjobsng", "africatechjobs", "remotejobsafrica",
 ]
 
