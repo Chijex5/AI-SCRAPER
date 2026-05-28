@@ -22,6 +22,7 @@ from google import genai
 from telethon import TelegramClient
 from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
 from telethon.sessions import StringSession
+from score import score_signal
 
 
 load_dotenv()
@@ -440,7 +441,7 @@ def item_to_doc(item: dict) -> dict:
     source_confidence     = _conf(source_confidence_raw)
 
     # ── Derived / computed fields ─────────────────────────────────────────────
-    ai_match_score    = EXTRACTION_CONFIDENCE_SCORE.get(extraction_confidence, 65)
+    ai_match_score, breakdown  = score_signal(item)
     ai_summary        = notes or _truncate(raw_text, 220) or "No summary available."
     source_post_prev  = _truncate(raw_text, 280)
     source_handle     = channel or username or source
@@ -1683,20 +1684,18 @@ async def get_related_signals(id: str):
 async def update_signal_status(signal_id: str, body: StatusUpdate):
     col = get_signals()
     oid = valid_object_id(signal_id)
-    print(f"Updating signal {signal_id} to status '{body.status.value}' (isSaved={body.status.value == 'saved'})")
 
-    update: dict[str, object] = {
-        "status": body.status.value
-    }
-
-    if body.status.value == "saved":
-        update["isSaved"] = True
-    elif body.status.value == "new":
-        update["isSaved"] = False
+    status = body.status.value
+    is_saved = status != "new"
 
     updated = await col.find_one_and_update(
         {"_id": oid},
-        {"$set": update},
+        {
+            "$set": {
+                "status": status,
+                "isSaved": is_saved
+            }
+        },
         return_document=ReturnDocument.AFTER,
     )
 
