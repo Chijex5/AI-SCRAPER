@@ -19,6 +19,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 from pydantic import BaseModel
 from google import genai
+from telethon import TelegramClient
+from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
+from telethon.sessions import StringSession
+
 
 load_dotenv()
 
@@ -34,6 +38,8 @@ SCRAPE_MINUTE = int(os.getenv("SCRAPE_MINUTE", "0"))
 TELEGRAM_API_ID   = int(os.getenv("TELEGRAM_API_ID",   "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH",     "")
 TELEGRAM_PHONE    = os.getenv("TELEGRAM_PHONE",        "")
+SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
+
 
 BATCH_SIZE = 8   # smaller — richer prompt = more tokens per item
 
@@ -727,16 +733,14 @@ async def fetch_telegram() -> list[dict]:
     if not (TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_PHONE):
         print("  ↳ Telegram: skipped (credentials not set)")
         return []
-    try:
-        from telethon import TelegramClient
-        from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
-    except ImportError:
-        print("  ↳ Telegram: skipped (pip install telethon)")
-        return []
 
     listings: list[dict] = []
     seen: set[str] = set()
-    tg = TelegramClient("scraper", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    tg = TelegramClient(
+        StringSession(SESSION_STRING),  # restores auth from env var
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+    )
     await tg.start(phone=TELEGRAM_PHONE)
     for channel in TELEGRAM_CHANNELS:
         try:
@@ -948,7 +952,7 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
             key_label   = f"key {idx + 1}/{n_keys}"
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.1-flash-lite",
                     contents=prompt,
                 )
                 results = _parse_gemini_response(response.text, batch)
@@ -1612,9 +1616,29 @@ async def get_signals_route(
         # Case-insensitive substring match inside the skillTags array
         query["skillTags"] = {"$elemMatch": {"$regex": skill_tag, "$options": "i"}}
 
-    sort_fields = (
-        [("aiMatchScore", -1), ("_id", -1)] if sort == "score"
-        else [("_id", -1)]
+    SORT_FIELDS = {
+        "newest": [
+            ("addedAt", -1)
+        ],
+
+        "oldest": [
+            ("addedAt", 1)
+        ],
+
+        "match": [
+            ("aiMatchScore", -1),
+            ("addedAt", -1)
+        ],
+
+        "platform": [
+            ("platform", 1),
+            ("addedAt", -1)
+        ],
+    }
+
+    sort_fields = SORT_FIELDS.get(
+        sort,
+        SORT_FIELDS["newest"]
     )
 
     docs, total = await asyncio.gather(
