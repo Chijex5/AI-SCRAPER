@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 from pydantic import BaseModel
@@ -151,11 +152,14 @@ class PaginatedSignals(BaseModel):
 
 
 class ScrapeStatus(BaseModel):
-    running:   bool
-    lastRun:   Optional[str] = None
-    lastSaved: Optional[int] = None
-    nextRun:   Optional[str] = None
-    message:   str
+    running:       bool
+    lastRun:       Optional[str] = None
+    lastSaved:     Optional[int] = None
+    nextRun:       Optional[str] = None
+    message:       str
+    progress:      int           = 0
+    phase:         str           = "idle"
+    currentSource: Optional[str] = None
 
 class NotificationCategory(str):
     """Mirrors the TypeScript union — kept as str so it round-trips cleanly."""
@@ -184,6 +188,24 @@ class NotificationItemModel(BaseModel):
     isImportant:  bool           = False   # toggled by user, survives regeneration
     isDismissed:  bool           = False   # soft-delete; restore sets back to False
 
+ 
+class TelegramChannel(BaseModel):
+    id:        str
+    handle:    str          # e.g. "jobnetworkng"  (no @)
+    name:      str          # display name
+    active:    bool = True  # enable/disable scraping
+    addedAt:   str
+ 
+ 
+class TelegramChannelCreate(BaseModel):
+    handle: str             # user supplies this — we normalise the @
+    name:   Optional[str] = None
+ 
+ 
+class TelegramChannelPatch(BaseModel):
+    active: Optional[bool] = None
+    name:   Optional[str]  = None
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATABASE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -206,6 +228,10 @@ async def connect_db() -> None:
     await col.create_index("applicationStatus")
     await col.create_index("extractionConfidence")
     await col.create_index("status")
+    channels_col = db.client[DB_NAME]["telegram_channels"]
+    await channels_col.create_index("handle", unique=True)
+    await channels_col.create_index("active")
+    await seed_channels_if_empty()
     db.signals = col
     notif_col = db.client[DB_NAME]["notifications"]
     await notif_col.create_index("section")
@@ -219,6 +245,37 @@ async def close_db() -> None:
     if db.client:
         db.client.close()
 
+def get_channels_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["telegram_channels"]
+ 
+ 
+async def seed_channels_if_empty():
+    """On first boot, populate the channels collection from the hardcoded seed list."""
+    col = get_channels_col()
+    if await col.count_documents({}) == 0:
+        now = datetime.now(timezone.utc).isoformat()
+        docs = [
+            {
+                "_id":     handle,
+                "id":      handle,
+                "handle":  handle,
+                "name":    f"@{handle}",
+                "active":  True,
+                "addedAt": now,
+            }
+            for handle in TELEGRAM_CHANNELS_SEED
+        ]
+        await col.insert_many(docs)
+        print(f"🌱 Seeded {len(docs)} Telegram channels into DB")
+ 
+ 
+async def get_active_channels() -> list[str]:
+    """Returns handles of all enabled channels."""
+    col = get_channels_col()
+    docs = await col.find({"active": True}, {"handle": 1}).to_list(length=500)
+    return [d["handle"] for d in docs]
 
 def get_signals() -> AsyncIOMotorCollection:
     if db.signals is None:
@@ -229,10 +286,16 @@ def get_signals() -> AsyncIOMotorCollection:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SCRAPE STATE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-scrape_state: dict[str, Any] = {
-    "running":    False,
-    "last_run":   None,
-    "last_saved": None,
+scrape_state: dict = {
+    "running":          False,
+    "last_run":         None,
+    "last_saved":       None,
+    # ── progress fields (new) ─────────────────────────────────────────────
+    "progress":         0,       # 0–100 int
+    "total_steps":      0,       # total work units for this run
+    "completed_steps":  0,       # how many finished
+    "current_source":   None,    # e.g. "Telegram @jobnetworkng"
+    "phase":            "idle",  # idle | fetching | validating | saving | done
 }
 
 
@@ -529,7 +592,7 @@ ROLE_KEYWORDS = [
     "developer", "engineer", "programmer",
 ]
 
-TELEGRAM_CHANNELS = [
+TELEGRAM_CHANNELS_SEED = [
     "jobnetworkng", "remotejobss", "ingressive4good",
     "jbtoday", "nigeriatechjobs", "lagostechjobs",
     "techJobsNG", "devjobsng", "africatechjobs", "remotejobsafrica",
@@ -729,21 +792,33 @@ async def fetch_himalayas(client: httpx.AsyncClient) -> list[dict]:
     print(f"  ↳ Himalayas: {len(listings)}")
     return listings
 
-
 async def fetch_telegram() -> list[dict]:
     if not (TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_PHONE):
         print("  ↳ Telegram: skipped (credentials not set)")
         return []
-
+ 
+    channels = await get_active_channels()
+    if not channels:
+        print("  ↳ Telegram: no active channels")
+        return []
+ 
     listings: list[dict] = []
-    seen: set[str] = set()
+    seen:     set[str]   = set()
+ 
     tg = TelegramClient(
-        StringSession(SESSION_STRING),  # restores auth from env var
+        StringSession(SESSION_STRING),
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
     )
     await tg.start(phone=TELEGRAM_PHONE)
-    for channel in TELEGRAM_CHANNELS:
+ 
+    for i, channel in enumerate(channels):
+        # ── update global progress state ─────────────────────────────────
+        scrape_state["current_source"] = f"Telegram @{channel}"
+        # telegram channels are the last phase; map i → overall progress 70-95
+        tg_progress = 70 + int((i / max(len(channels), 1)) * 25)
+        scrape_state["progress"] = tg_progress
+ 
         try:
             entity   = await tg.get_entity(channel)
             messages = await tg.get_messages(entity, limit=100)
@@ -759,21 +834,24 @@ async def fetch_telegram() -> list[dict]:
                 seen.add(mid)
                 found += 1
                 listings.append({
-                    "id": mid, "source": "Telegram", "channel": channel,
-                    "text": msg.text[:1000],
+                    "id":         mid,
+                    "source":     "Telegram",
+                    "channel":    channel,
+                    "text":       msg.text[:1000],
                     "created_at": msg.date.isoformat() if msg.date else "",
-                    "url": f"https://t.me/{channel}/{msg.id}",
-                    "user": channel, "username": channel,
+                    "url":        f"https://t.me/{channel}/{msg.id}",
+                    "user":       channel,
+                    "username":   channel,
                 })
             print(f"    • @{channel}: {found}")
         except (ChannelInvalidError, UsernameNotOccupiedError):
             print(f"    ⚠  @{channel}: not found / private")
         except Exception as e:
             print(f"    ⚠  @{channel}: {e}")
+ 
     await tg.disconnect()
     print(f"  ↳ Telegram: {len(listings)}")
     return listings
-
 
 async def scrape_all() -> list[dict]:
     async with httpx.AsyncClient() as client:
@@ -1075,61 +1153,112 @@ async def run_scrape_pipeline() -> dict[str, int]:
     if scrape_state["running"]:
         print("⚠  Scrape already in progress, skipping.")
         return {"saved": 0, "skipped": 0}
-
-    scrape_state["running"] = True
-    col = get_signals()
+ 
+    # ── reset progress ────────────────────────────────────────────────────
+    scrape_state.update({
+        "running":         True,
+        "progress":        0,
+        "total_steps":     0,
+        "completed_steps": 0,
+        "current_source":  "Starting…",
+        "phase":           "fetching",
+    })
+ 
+    col   = get_signals()
     saved = skipped = 0
-
+ 
     try:
         print(f"\n🕐 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scrape started")
-
-        print("📡 Fetching from all sources...")
-        raw = await scrape_all()
-        print(f"  📦 {len(raw)} total unique raw listings")
-
-        if not raw:
-            print("  ❌ No listings found.")
+ 
+        # ── PHASE 1: fetch (0 → 40%) ──────────────────────────────────────
+        scrape_state["phase"]    = "fetching"
+        scrape_state["progress"] = 5
+ 
+        web_sources = [
+            ("Remotive",  fetch_remotive),
+            ("Jobberman", fetch_jobberman),
+            ("MyJobMag",  fetch_myjobmag),
+            ("Himalayas", fetch_himalayas),
+        ]
+        web_results: list[list[dict]] = []
+        async with httpx.AsyncClient() as client:
+            for idx, (src_name, fn) in enumerate(web_sources):
+                scrape_state["current_source"] = src_name
+                scrape_state["progress"]       = 5 + int((idx / len(web_sources)) * 35)
+                web_results.append(await fn(client))
+ 
+        scrape_state["progress"]      = 40
+        scrape_state["current_source"] = "Telegram channels"
+        tg = await fetch_telegram()  # updates progress 40→70 internally
+ 
+        # ── combine & dedupe ──────────────────────────────────────────────
+        scrape_state["progress"] = 70
+        combined: list[dict] = []
+        seen_ids: set[str]   = set()
+        for source_list in [*web_results, tg]:
+            for item in source_list:
+                uid = f"{item['source']}:{item['id']}"
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    combined.append(item)
+ 
+        print(f"  📦 {len(combined)} total unique raw listings")
+ 
+        if not combined:
+            scrape_state.update({"progress": 100, "phase": "done", "current_source": None})
             return {"saved": 0, "skipped": 0}
-
-        print("🔎 Checking DB for already-scraped duplicates...")
-        fresh = await filter_already_scraped(raw)
-        print(f"  📬 {len(fresh)} new listings (dropped {len(raw) - len(fresh)} dupes)")
-
+ 
+        # ── PHASE 2: dedup check (70 → 75%) ──────────────────────────────
+        scrape_state["phase"]          = "validating"
+        scrape_state["current_source"] = "Checking duplicates"
+        fresh = await filter_already_scraped(combined)
+        scrape_state["progress"] = 75
+        print(f"  📬 {len(fresh)} new listings (dropped {len(combined) - len(fresh)} dupes)")
+ 
         if not fresh:
-            print("  ✅ Nothing new to process.")
-            scrape_state["last_run"]   = datetime.now(timezone.utc).isoformat()
-            scrape_state["last_saved"] = 0
-            return {"saved": 0, "skipped": len(raw)}
-
-        print("🤖 Validating + enriching with Gemini — saving each batch immediately...")
-        total_batches = -(-len(fresh) // BATCH_SIZE)   # ceiling division
-
+            scrape_state.update({
+                "progress": 100, "phase": "done",
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "last_saved": 0, "current_source": None,
+            })
+            return {"saved": 0, "skipped": len(combined)}
+ 
+        # ── PHASE 3: Gemini validation (75 → 95%) ────────────────────────
+        total_batches = -(-len(fresh) // BATCH_SIZE)
+        scrape_state["total_steps"] = total_batches
+ 
         for batch_num, i in enumerate(range(0, len(fresh), BATCH_SIZE), start=1):
-            batch = fresh[i : i + BATCH_SIZE]
-            print(f"  [{batch_num}/{total_batches}] Validating items {i+1}–{i+len(batch)} of {len(fresh)}...")
-
-            # ── Gemini (may backoff+retry internally; raises RuntimeError if unrecoverable) ──
+            batch = fresh[i: i + BATCH_SIZE]
+            scrape_state["current_source"] = f"AI validation — batch {batch_num}/{total_batches}"
+            # 75% + up to 20% spread across batches
+            scrape_state["progress"] = 75 + int((batch_num / total_batches) * 20)
+            scrape_state["completed_steps"] = batch_num
+ 
+            print(f"  [{batch_num}/{total_batches}] Validating items {i+1}–{i+len(batch)}…")
             validated = await validate_batch(batch)
-
+ 
             if not validated:
-                print(f"    ↳ 0 valid in this batch — skipping DB write")
                 skipped += len(batch)
                 continue
-
-            # ── Write immediately — no waiting for the rest of the batches ──
+ 
+            # ── PHASE 4: save (95 → 99%) ──────────────────────────────────
+            scrape_state["phase"] = "saving"
             b_saved, b_skipped = await save_batch(col, validated)
             saved   += b_saved
             skipped += b_skipped
-            print(f"    ↳ {b_saved} saved, {b_skipped} skipped  (running total: {saved} saved)")
-
-            # Update state after every batch so /scrape/status stays fresh
             scrape_state["last_saved"] = saved
-
-        scrape_state["last_run"]   = datetime.now(timezone.utc).isoformat()
-        scrape_state["last_saved"] = saved
+            print(f"    ↳ {b_saved} saved, {b_skipped} skipped  (total: {saved})")
+ 
+        scrape_state.update({
+            "last_run":        datetime.now(timezone.utc).isoformat(),
+            "last_saved":      saved,
+            "progress":        100,
+            "phase":           "done",
+            "current_source":  None,
+        })
         print(f"✅ Pipeline done — saved {saved}, skipped {skipped}\n")
         return {"saved": saved, "skipped": skipped}
-
+ 
     finally:
         scrape_state["running"] = False
 
@@ -1743,16 +1872,111 @@ async def scrape_status():
     job      = scheduler.get_job("daily_scrape")
     next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
     return ScrapeStatus(
-        running   = scrape_state["running"],
-        lastRun   = scrape_state["last_run"],
-        lastSaved = scrape_state["last_saved"],
-        nextRun   = next_run,
-        message   = (
-            "Scrape in progress..." if scrape_state["running"]
+        running       = scrape_state["running"],
+        lastRun       = scrape_state["last_run"],
+        lastSaved     = scrape_state["last_saved"],
+        nextRun       = next_run,
+        progress      = scrape_state["progress"],
+        phase         = scrape_state["phase"],
+        currentSource = scrape_state["current_source"],
+        message       = (
+            f"{scrape_state['phase'].capitalize()} — "
+            f"{scrape_state['progress']}%"
+            + (f" ({scrape_state['current_source']})" if scrape_state["current_source"] else "")
+            if scrape_state["running"]
             else f"Next scheduled run: {next_run or 'unknown'}"
         ),
     )
 
+
+@app.get("/scrape/stream")
+async def scrape_stream():
+    async def event_generator():
+        idle_ticks = 0
+        while True:
+            payload = {
+                "running":       scrape_state["running"],
+                "progress":      scrape_state["progress"],
+                "phase":         scrape_state["phase"],
+                "currentSource": scrape_state["current_source"],
+                "lastSaved":     scrape_state["last_saved"],
+                "lastRun":       scrape_state["last_run"],
+            }
+            yield f"data: {json.dumps(payload)}\\n\\n"
+ 
+            if not scrape_state["running"]:
+                idle_ticks += 1
+                if idle_ticks >= 3:   # 3 s of idle → close stream
+                    break
+            else:
+                idle_ticks = 0
+ 
+            await asyncio.sleep(1)
+ 
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
+
+@app.get("/channels", response_model=list[TelegramChannel])
+async def list_channels():
+    col  = get_channels_col()
+    docs = await col.find({}).sort("addedAt", 1).to_list(length=500)
+    return [TelegramChannel(**{**d, "id": str(d.get("id") or d["_id"])}) for d in docs]
+
+@app.post("/channels", response_model=TelegramChannel, status_code=201)
+async def add_channel(body: TelegramChannelCreate):
+    col    = get_channels_col()
+    handle = body.handle.lstrip("@").strip().lower()
+    if not handle:
+        raise HTTPException(status_code=400, detail="handle is required")
+ 
+    existing = await col.find_one({"handle": handle})
+    if existing:
+        raise HTTPException(status_code=409, detail=f"@{handle} already exists")
+ 
+    doc = {
+        "_id":     handle,
+        "id":      handle,
+        "handle":  handle,
+        "name":    body.name or f"@{handle}",
+        "active":  True,
+        "addedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    await col.insert_one(doc)
+    return TelegramChannel(**doc)
+
+@app.patch("/channels/{handle}", response_model=TelegramChannel)
+async def patch_channel(handle: str, body: TelegramChannelPatch):
+    col    = get_channels_col()
+    handle = handle.lstrip("@").lower()
+    update: dict = {}
+    if body.active  is not None: update["active"] = body.active
+    if body.name    is not None: update["name"]   = body.name
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+ 
+    doc = await col.find_one_and_update(
+        {"handle": handle},
+        {"$set": update},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"@{handle} not found")
+    return TelegramChannel(**{**doc, "id": str(doc.get("id") or doc["_id"])})
+
+@app.delete("/channels/{handle}")
+async def delete_channel(handle: str):
+    col    = get_channels_col()
+    handle = handle.lstrip("@").lower()
+    result = await col.delete_one({"handle": handle})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"@{handle} not found")
+    return {"success": True, "handle": handle}
 
 # ── GET /meta ─────────────────────────────────────────────────────────────────
 @app.get("/meta")
