@@ -206,6 +206,40 @@ class TelegramChannelPatch(BaseModel):
     active: Optional[bool] = None
     name:   Optional[str]  = None
 
+class PipelineEvent(BaseModel):
+    id:      str
+    message: str
+    status:  str   # active | info | high | error
+    at:      str   # ISO timestamp
+ 
+ 
+class MonitorResponse(BaseModel):
+    # ── Scrape status ─────────────────────────────────────────────────────
+    scrapeRunning:    bool
+    scrapePhase:      str
+    scrapeProgress:   int
+    currentSource:    Optional[str]
+    lastRun:          Optional[str]
+    lastSaved:        Optional[int]
+    nextRun:          Optional[str]
+ 
+    # ── Signal counts ─────────────────────────────────────────────────────
+    totalSignals:     int
+    newSignals:       int          # status == "new"
+    savedSignals:     int          # isSaved == True
+    highMatchSignals: int          # aiMatchScore >= 80
+ 
+    # ── Platform breakdown ────────────────────────────────────────────────
+    platformCounts:   dict[str, int]   # { "Telegram": 42, "Remotive": 18, ... }
+ 
+    # ── Notification stats ────────────────────────────────────────────────
+    notifRunning:     bool
+    notifLastRun:     Optional[str]
+    notifLastCount:   Optional[int]
+ 
+    # ── Live events ───────────────────────────────────────────────────────
+    recentEvents:     list[PipelineEvent]
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DATABASE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -238,6 +272,15 @@ async def connect_db() -> None:
     await notif_col.create_index("priority")
     await notif_col.create_index("isRead")
     await notif_col.create_index("generatedAt")
+    existing_cols = await db.client[DB_NAME].list_collection_names()
+    if "pipeline_events" not in existing_cols:
+        await db.client[DB_NAME].create_collection(
+            "pipeline_events",
+            capped=True,
+            size=1_000_000,   # 1 MB cap
+            max=100,          # max 100 documents
+        )
+    print("✅ pipeline_events collection ready")
     print(f"✅ MongoDB connected → {DB_NAME}.signals")
 
 
@@ -310,7 +353,24 @@ def get_notifications_col() -> AsyncIOMotorCollection:
     if db.client is None:
         raise RuntimeError("Database not initialised")
     return db.client[DB_NAME]["notifications"]
-    
+
+def get_events_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["pipeline_events"]
+
+async def log_event(message: str, status: str = "info") -> None:
+    """Insert one pipeline event. Silently swallows errors so it never breaks the pipeline."""
+    try:
+        col = get_events_col()
+        await col.insert_one({
+            "message": message,
+            "status":  status,
+            "at":      datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        print(f"  ⚠  log_event failed: {e}")
+
 def _notif_id(prefix: str, *parts: str) -> str:
     """Stable, short, collision-resistant ID for a notification."""
     raw = f"{prefix}:{'|'.join(str(p) for p in parts)}"
@@ -1169,6 +1229,7 @@ async def run_scrape_pipeline() -> dict[str, int]:
  
     try:
         print(f"\n🕐 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scrape started")
+        await log_event("Scrape pipeline started", "active")
  
         # ── PHASE 1: fetch (0 → 40%) ──────────────────────────────────────
         scrape_state["phase"]    = "fetching"
@@ -1186,7 +1247,8 @@ async def run_scrape_pipeline() -> dict[str, int]:
                 scrape_state["current_source"] = src_name
                 scrape_state["progress"]       = 5 + int((idx / len(web_sources)) * 35)
                 web_results.append(await fn(client))
- 
+                await log_event(f"Fetched {len(web_results[-1])} listings from {src_name}", "info")
+            
         scrape_state["progress"]      = 40
         scrape_state["current_source"] = "Telegram channels"
         tg = await fetch_telegram()  # updates progress 40→70 internally
@@ -1202,6 +1264,7 @@ async def run_scrape_pipeline() -> dict[str, int]:
                     seen_ids.add(uid)
                     combined.append(item)
  
+        await log_event(f"Telegram scan complete — {len(tg)} messages matched", "info")
         print(f"  📦 {len(combined)} total unique raw listings")
  
         if not combined:
@@ -1214,6 +1277,10 @@ async def run_scrape_pipeline() -> dict[str, int]:
         fresh = await filter_already_scraped(combined)
         scrape_state["progress"] = 75
         print(f"  📬 {len(fresh)} new listings (dropped {len(combined) - len(fresh)} dupes)")
+        await log_event(
+        f"{len(fresh)} new listings after dedup (dropped {len(combined) - len(fresh)})",
+        "info",
+    )
  
         if not fresh:
             scrape_state.update({
@@ -1248,6 +1315,10 @@ async def run_scrape_pipeline() -> dict[str, int]:
             skipped += b_skipped
             scrape_state["last_saved"] = saved
             print(f"    ↳ {b_saved} saved, {b_skipped} skipped  (total: {saved})")
+            await log_event(
+                f"Batch {batch_num}/{total_batches} — {b_saved} saved, {b_skipped} skipped",
+                "high" if b_saved > 0 else "info",
+            )
  
         scrape_state.update({
             "last_run":        datetime.now(timezone.utc).isoformat(),
@@ -1257,8 +1328,15 @@ async def run_scrape_pipeline() -> dict[str, int]:
             "current_source":  None,
         })
         print(f"✅ Pipeline done — saved {saved}, skipped {skipped}\n")
+        await log_event(
+            f"Pipeline complete — {saved} new signals saved, {skipped} skipped",
+            "high" if saved > 0 else "info",
+        )
         return {"saved": saved, "skipped": skipped}
- 
+    except Exception as e:
+        print(f"❌ Pipeline error: {e}")
+        await log_event(f"Pipeline error: {str(e)}", "error")
+
     finally:
         scrape_state["running"] = False
 
@@ -1977,6 +2055,67 @@ async def delete_channel(handle: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"@{handle} not found")
     return {"success": True, "handle": handle}
+
+@app.get("/monitor", response_model=MonitorResponse)
+async def get_monitor():
+    sig_col    = get_signals()
+    events_col = get_events_col()
+    job        = scheduler.get_job("daily_scrape")
+    next_run   = job.next_run_time.isoformat() if job and job.next_run_time else None
+ 
+    # ── Run DB queries concurrently ───────────────────────────────────────
+    (
+        total,
+        new_count,
+        saved_count,
+        high_match,
+        platform_pipeline,
+        raw_events,
+    ) = await asyncio.gather(
+        sig_col.count_documents({}),
+        sig_col.count_documents({"status": "new"}),
+        sig_col.count_documents({"isSaved": True}),
+        sig_col.count_documents({"aiMatchScore": {"$gte": 80}}),
+        sig_col.aggregate([
+            {"$group": {"_id": "$platform", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+        ]).to_list(length=20),
+        events_col.find({}).sort("at", -1).limit(15).to_list(length=15),
+    )
+ 
+    platform_counts = {doc["_id"]: doc["count"] for doc in platform_pipeline if doc["_id"]}
+ 
+    events_out = [
+        PipelineEvent(
+            id      = str(e["_id"]),
+            message = e["message"],
+            status  = e["status"],
+            at      = e["at"],
+        )
+        for e in reversed(raw_events)   # chronological order for the feed
+    ]
+ 
+    return MonitorResponse(
+        scrapeRunning    = scrape_state["running"],
+        scrapePhase      = scrape_state["phase"],
+        scrapeProgress   = scrape_state["progress"],
+        currentSource    = scrape_state["current_source"],
+        lastRun          = scrape_state["last_run"],
+        lastSaved        = scrape_state["last_saved"],
+        nextRun          = next_run,
+ 
+        totalSignals     = total,
+        newSignals       = new_count,
+        savedSignals     = saved_count,
+        highMatchSignals = high_match,
+        platformCounts   = platform_counts,
+ 
+        notifRunning     = notifications_state["running"],
+        notifLastRun     = notifications_state["last_run"],
+        notifLastCount   = notifications_state["last_count"],
+ 
+        recentEvents     = events_out,
+    )
 
 # ── GET /meta ─────────────────────────────────────────────────────────────────
 @app.get("/meta")
