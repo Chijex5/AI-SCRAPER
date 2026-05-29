@@ -1826,16 +1826,18 @@ async def get_signals_route(
 
     SORT_FIELDS = {
         "newest": [
-            ("addedAt", -1)
+            ("postedAt", -1),
+            ("addedAt",  -1)
         ],
 
         "oldest": [
+            ("postedAt", 1),
             ("addedAt", 1)
         ],
 
         "match": [
             ("aiMatchScore", -1),
-            ("addedAt", -1)
+            ("postedAt", -1)
         ],
 
         "platform": [
