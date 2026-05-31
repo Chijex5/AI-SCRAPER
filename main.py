@@ -272,6 +272,13 @@ async def connect_db() -> None:
     await notif_col.create_index("priority")
     await notif_col.create_index("isRead")
     await notif_col.create_index("generatedAt")
+    # In connect_db(), add this index:
+    await col.create_index([
+        ("role",      "text"),
+        ("company",   "text"),
+        ("aiSummary", "text"),
+        ("skillTags", "text"),
+    ], name="text_search")
     existing_cols = await db.client[DB_NAME].list_collection_names()
     if "pipeline_events" not in existing_cols:
         await db.client[DB_NAME].create_collection(
@@ -1790,66 +1797,115 @@ def valid_object_id(id: str) -> ObjectId:
 
 app.include_router(health_router)   
 
-# ── GET /signals ──────────────────────────────────────────────────────────────
 @app.get("/signals", response_model=PaginatedSignals)
 async def get_signals_route(
-    page:                int                        = Query(default=1,    ge=1),
-    limit:               int                        = Query(default=100,  ge=1, le=200),
-    status:              Optional[PipelineStage]    = Query(default=None),
-    platform:            Optional[str]              = Query(default=None),
-    location:            Optional[str]              = Query(default=None),
-    isSaved:             Optional[bool]            = Query(default=None),
-    role_mode:           Optional[RoleMode]         = Query(default=None),
-    role_type:           Optional[str]              = Query(default=None),
-    application_status:  Optional[ApplicationStatus]= Query(default=None),
-    extraction_confidence: Optional[ConfidenceLevel]= Query(default=None),
-    source_confidence:   Optional[ConfidenceLevel]  = Query(default=None),
-    skill_tag:           Optional[str]              = Query(default=None, description="Filter by a skill tag (case-insensitive substring)"),
-    sort:                str                        = Query(default="newest", description="newest | score"),
+    page:                 int                         = Query(default=1,   ge=1),
+    limit:                int                         = Query(default=100, ge=1, le=200),
+    status:               Optional[PipelineStage]     = Query(default=None),
+    platform:             Optional[str]               = Query(default=None),
+    location:             Optional[str]               = Query(default=None),
+    isSaved:              Optional[bool]              = Query(default=None),
+    role_mode:            Optional[RoleMode]           = Query(default=None),
+    role_type:            Optional[str]               = Query(default=None),
+    application_status:   Optional[ApplicationStatus] = Query(default=None),
+    extraction_confidence:Optional[ConfidenceLevel]   = Query(default=None),
+    source_confidence:    Optional[ConfidenceLevel]   = Query(default=None),
+    skill_tag:            Optional[str]               = Query(default=None),
+    # ── new params ───────────────────────────────────────────────────────
+    search:               Optional[str]               = Query(default=None, description="Full-text search across role, company, summary, skills"),
+    role_category:        Optional[str]               = Query(default=None, description="frontend|backend|ai|data|mobile|devops|qa|design"),
+    location_filter:      Optional[str]               = Query(default=None, description="remote|nigeria|global"),
+    skill_filter:         Optional[str]               = Query(default=None, description="react|python|etc — skill keyword"),
+    sort:                 str                         = Query(default="newest"),
 ):
     col   = get_signals()
     skip  = (page - 1) * limit
     query: dict[str, Any] = {}
 
-    if status:               query["status"]               = status.value
-    if platform:             query["platform"]             = platform
-    if location:             query["location"]             = location
-    if isSaved is not None:  query["isSaved"]              = isSaved
-    if role_mode:            query["roleMode"]             = role_mode.value
-    if role_type:            query["roleType"]             = role_type
-    if application_status:   query["applicationStatus"]   = application_status.value
+    if status:                query["status"]               = status.value
+    if platform:              query["platform"]             = platform
+    if isSaved is not None:   query["isSaved"]              = isSaved
+    if role_mode:             query["roleMode"]             = role_mode.value
+    if role_type:             query["roleType"]             = role_type
+    if application_status:    query["applicationStatus"]    = application_status.value
     if extraction_confidence: query["extractionConfidence"] = extraction_confidence.value
-    if source_confidence:    query["sourceConfidence"]     = source_confidence.value
-    if skill_tag:
-        # Case-insensitive substring match inside the skillTags array
-        query["skillTags"] = {"$elemMatch": {"$regex": skill_tag, "$options": "i"}}
+    if source_confidence:     query["sourceConfidence"]     = source_confidence.value
 
-    SORT_FIELDS = {
-        "newest": [
-            ("postedAt", -1),
-            ("addedAt",  -1)
-        ],
-
-        "oldest": [
-            ("postedAt", 1),
-            ("addedAt", 1)
-        ],
-
-        "match": [
-            ("aiMatchScore", -1),
-            ("postedAt", -1)
-        ],
-
-        "platform": [
-            ("platform", 1),
-            ("addedAt", -1)
-        ],
+    # ── role_category → roleType regex ───────────────────────────────────
+    ROLE_CATEGORY_MAP: dict[str, Any] = {
+        "frontend": {"roleType": {"$regex": "Software Engineering", "$options": "i"},
+                     "$or": [{"role": {"$regex": "front", "$options": "i"}},
+                              {"skillTags": {"$elemMatch": {"$regex": "react|vue|angular|css|html|svelte|next", "$options": "i"}}}]},
+        "backend":  {"$or": [{"role": {"$regex": "back|server|api|node|django|flask|fastapi|spring|rails|laravel", "$options": "i"}},
+                              {"skillTags": {"$elemMatch": {"$regex": "node|python|java|go|rust|php|ruby|postgres|mysql|mongo|redis", "$options": "i"}}}]},
+        "ai":       {"$or": [{"role": {"$regex": "ai|ml|machine learning|data scien|nlp|llm|deep learn", "$options": "i"}},
+                              {"roleType": {"$regex": "Data", "$options": "i"}},
+                              {"skillTags": {"$elemMatch": {"$regex": "tensorflow|pytorch|sklearn|hugging|llm|openai|langchain", "$options": "i"}}}]},
+        "data":     {"$or": [{"roleType": {"$regex": "Data", "$options": "i"}},
+                              {"role": {"$regex": "data|analyst|analytics|bi |tableau|dbt|spark|airflow", "$options": "i"}}]},
+        "mobile":   {"$or": [{"roleType": {"$regex": "Mobile", "$options": "i"}},
+                              {"role": {"$regex": "mobile|android|ios|flutter|react native|kotlin|swift", "$options": "i"}}]},
+        "devops":   {"$or": [{"roleType": {"$regex": "DevOps", "$options": "i"}},
+                              {"role": {"$regex": "devops|sre|cloud|infra|kubernetes|docker|cicd|platform engineer", "$options": "i"}}]},
+        "qa":       {"$or": [{"roleType": {"$regex": "QA", "$options": "i"}},
+                              {"role": {"$regex": "qa|quality|test|sdet|automation engineer", "$options": "i"}}]},
+        "design":   {"$or": [{"roleType": {"$regex": "Design", "$options": "i"}},
+                              {"role": {"$regex": "design|ux|ui |figma|product design", "$options": "i"}}]},
     }
 
-    sort_fields = SORT_FIELDS.get(
-        sort,
-        SORT_FIELDS["newest"]
-    )
+    if role_category and role_category.lower() in ROLE_CATEGORY_MAP:
+        cat_query = ROLE_CATEGORY_MAP[role_category.lower()]
+        # Merge $or carefully — if cat_query IS an $or, wrap with $and
+        if "$or" in cat_query and "$or" in query:
+            query = {"$and": [query, cat_query]}
+        else:
+            query.update(cat_query)
+
+    # ── location_filter ───────────────────────────────────────────────────
+    if location_filter:
+        lf = location_filter.lower()
+        if lf == "remote":
+            query["roleMode"] = "Remote"
+        elif lf == "nigeria":
+            query["location"] = {"$regex": "nigeria", "$options": "i"}
+        elif lf == "global":
+            query["$and"] = query.get("$and", []) + [
+                {"location": {"$not": {"$regex": "nigeria", "$options": "i"}}},
+                {"roleMode": "Remote"},
+            ]
+    elif location:
+        query["location"] = location
+
+    # ── skill_filter (substring in skillTags array) ───────────────────────
+    if skill_filter:
+        query["skillTags"] = {"$elemMatch": {"$regex": skill_filter, "$options": "i"}}
+    elif skill_tag:
+        query["skillTags"] = {"$elemMatch": {"$regex": skill_tag, "$options": "i"}}
+
+    # ── full-text search ──────────────────────────────────────────────────
+    if search and search.strip():
+        s = search.strip()
+        search_or = [
+            {"role":      {"$regex": s, "$options": "i"}},
+            {"company":   {"$regex": s, "$options": "i"}},
+            {"aiSummary": {"$regex": s, "$options": "i"}},
+            {"skillTags": {"$elemMatch": {"$regex": s, "$options": "i"}}},
+            {"skillAlignment": {"$regex": s, "$options": "i"}},
+        ]
+        if "$and" in query:
+            query["$and"].append({"$or": search_or})
+        elif "$or" in query:
+            query = {"$and": [query, {"$or": search_or}]}
+        else:
+            query["$or"] = search_or
+
+    SORT_FIELDS = {
+        "newest":   [("postedAt", -1), ("addedAt",  -1)],
+        "oldest":   [("postedAt",  1), ("addedAt",   1)],
+        "match":    [("aiMatchScore", -1), ("postedAt", -1)],
+        "platform": [("platform", 1), ("addedAt", -1)],
+    }
+    sort_fields = SORT_FIELDS.get(sort, SORT_FIELDS["newest"])
 
     docs, total = await asyncio.gather(
         col.find(query).sort(sort_fields).skip(skip).limit(limit).to_list(length=limit),
@@ -1857,13 +1913,12 @@ async def get_signals_route(
     )
 
     return PaginatedSignals(
-        signals = [doc_to_signal(d) for d in docs],
-        total   = total,
-        page    = page,
-        pages   = -(-total // limit),
-        limit   = limit,
+        signals=[doc_to_signal(d) for d in docs],
+        total=total,
+        page=page,
+        pages=-(-total // limit),
+        limit=limit,
     )
-
 
 # ── GET /signals/{id} ─────────────────────────────────────────────────────────
 @app.get("/signals/{id}", response_model=IntelligenceSignal)
