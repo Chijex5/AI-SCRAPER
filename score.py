@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -47,27 +48,45 @@ DB_NAME     = os.getenv("DB_NAME", "jobless")
 # SCORING WEIGHTS  (must sum to 100)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# What makes a "perfect" signal for this user:
-#   ✅  Location  →  Nigeria Remote (best) or Nigeria Onsite (ok) > Remote > Other
-#   ✅  Seniority →  Intern / Junior / Entry-level keywords are gold
-#   ✅  Freshness →  ≤ 4 days old = full points; degrades fast after that
+# What makes a "perfect" signal for THIS user (a Nigerian dev seeking entry-level work):
+#   ✅  Seniority →  Intern / Junior / Entry-level / "Y-level" is the #1 thing
+#   ✅  Pay fit   →  intern stipend / modest pay = good;  ₦1m "professional" pay = NOT for me
+#   ✅  Location  →  Nigeria is a bonus, but ANY remote role is welcome ("others are ok")
 #   ✅  Role mode →  Remote > Hybrid > On-site
+#   ✅  Freshness →  fresher is better; degrades over ~14 days
 #   ✅  Role type →  Software Engineering / Mobile preferred
-#   ✅  Status    →  Open > Unknown >> Closing soon (ironically still valuable)
+#   ✅  Status    →  Open > Unknown >> Closing soon (still valuable)
 #   ✅  Richness  →  more skill tags = more signal that Gemini got good data
 #   ✅  Source    →  High confidence sources are more trustworthy
 #
+# Two changes vs. the old model, driven by user feedback:
+#   1. Seniority + a NEW pay-fit signal now dominate, because the make-or-break
+#      question is "is this an entry-level role or a senior/professional one?".
+#   2. A clearly senior / high-pay ("professional ₦1m") role gets an explicit
+#      LEVEL PENALTY applied AFTER the weighted sum, so it lands well below 50
+#      no matter how remote / fresh / Nigerian it is. (See SENIOR_PAY_THRESHOLD.)
+#
 WEIGHTS = {
-    "location":   30,   # single biggest factor — Nigerian remote is the goal
-    "seniority":  25,   # intern/junior keyword presence
-    "freshness":  20,   # age of the listing (capped at 14 days, steep curve)
-    "role_mode":  10,   # remote > hybrid > on-site
+    "seniority":  28,   # intern/junior/entry-level — the single biggest factor now
+    "location":   18,   # Nigeria is a bonus, but remote-anywhere is fine
+    "pay_fit":    14,   # NEW: low/stipend pay = good, ₦1m+ = professional = bad
+    "freshness":  13,   # age of the listing (capped at ~14 days)
+    "role_mode":  12,   # remote > hybrid > on-site
     "role_type":   5,   # software / mobile preferred
-    "status":      5,   # open > unknown > closing
+    "status":      4,   # open > unknown > closing
     "richness":    3,   # skill tag count — proxy for data quality
-    "source":      2,   # source confidence
+    "source":      3,   # source confidence
 }
 assert sum(WEIGHTS.values()) == 100, "Weights must sum to 100"
+
+# Pay at or above this NGN-equivalent monthly magnitude reads as a senior /
+# "professional" role rather than an intern / entry-level one. The user called
+# out "₦1m" explicitly as the kind of job they do NOT want to be matched against.
+SENIOR_PAY_THRESHOLD = 1_000_000
+
+# Rough FX multipliers to convert a foreign-currency figure to an NGN-equivalent
+# magnitude so the same thresholds work regardless of how pay was quoted.
+_FX_TO_NGN = {"usd": 1500.0, "eur": 1700.0, "gbp": 2000.0}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERN / JUNIOR KEYWORDS  (checked in role title + summary + raw text)
@@ -91,6 +110,67 @@ SENIOR_KEYWORDS = [
     "5+ year", "7+ year", "10+ year",
     "5 years", "7 years", "10 years",
 ]
+
+# Words that signal the pay is intern-grade / not a professional salary.
+_LOW_PAY_KEYWORDS = ["unpaid", "volunteer", "pro bono", "stipend", "allowance", "no pay"]
+
+
+def parse_pay(pay: Any) -> tuple[Optional[float], str, str]:
+    """
+    Best-effort parse of a free-text pay string into an NGN-equivalent magnitude.
+
+    Returns (amount, currency, label):
+      amount   — float NGN-equivalent (top of a range), or
+                 0.0 for explicit unpaid/stipend language, or
+                 None if no pay was stated / nothing parseable.
+      currency — "NGN" | "USD" | "EUR" | "GBP" | "" (none/unknown).
+      label    — short human description for the breakdown.
+
+    Examples it handles: "₦1,000,000", "1m", "500k/month", "₦250,000 - ₦400,000",
+    "$2000", "Unpaid internship", "Competitive".
+    """
+    if not pay or not str(pay).strip():
+        return None, "", "not stated"
+
+    s = str(pay).lower()
+
+    if any(kw in s for kw in _LOW_PAY_KEYWORDS):
+        return 0.0, "", "stipend/unpaid"
+
+    # Detect currency → NGN multiplier (default: assume the figure is already NGN)
+    if "$" in s or "usd" in s or "dollar" in s:
+        currency, mult = "USD", _FX_TO_NGN["usd"]
+    elif "€" in s or "eur" in s or "euro" in s:
+        currency, mult = "EUR", _FX_TO_NGN["eur"]
+    elif "£" in s or "gbp" in s or "pound" in s:
+        currency, mult = "GBP", _FX_TO_NGN["gbp"]
+    else:
+        currency, mult = "NGN", 1.0
+
+    # Pull out every number, honouring k / m suffixes and comma grouping.
+    amounts: list[float] = []
+    for num, suf in re.findall(r"(\d[\d,]*\.?\d*)\s*([km])?", s):
+        cleaned = num.replace(",", "")
+        if not cleaned or cleaned == ".":
+            continue
+        try:
+            val = float(cleaned)
+        except ValueError:
+            continue
+        if suf == "k":
+            val *= 1_000
+        elif suf == "m":
+            val *= 1_000_000
+        if val > 0:
+            amounts.append(val)
+
+    if not amounts:
+        return None, "", "unparseable"
+
+    # Use the top of any range (the most optimistic figure) for thresholding.
+    amount = max(amounts) * mult
+    label = f"≈₦{amount:,.0f}" if currency == "NGN" else f"{currency} ≈₦{amount:,.0f}"
+    return amount, currency, label
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,37 +198,11 @@ def score_signal(doc: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """
     breakdown: dict[str, Any] = {}
 
-    # ── 1. LOCATION (30 pts) ──────────────────────────────────────────────────
-    loc = (doc.get("location") or "").strip()
-    role_mode = (doc.get("roleMode") or "").strip()
-
-    loc_lower = loc.lower()
-    mode_lower = role_mode.lower()
-
-    # Nigeria Remote is the jackpot
-    if "nigeria" in loc_lower and ("remote" in loc_lower or "remote" in mode_lower):
-        loc_score = 30
-        loc_label = "Nigeria Remote"
-    elif "nigeria" in loc_lower and "onsite" in loc_lower.replace("-", "").replace(" ", ""):
-        loc_score = 20
-        loc_label = "Nigeria Onsite"
-    elif "nigeria" in loc_lower:
-        loc_score = 18
-        loc_label = "Nigeria (mode unclear)"
-    elif loc == "Remote" or "remote" in loc_lower:
-        loc_score = 14
-        loc_label = "Remote (non-Nigeria)"
-    elif loc in ("", "Unknown"):
-        loc_score = 5
-        loc_label = "Unknown"
-    else:
-        loc_score = 2
-        loc_label = f"Other ({loc})"
-
-    breakdown["location"] = {"score": loc_score, "max": 30, "label": loc_label}
-
-    # ── 2. SENIORITY (25 pts) ────────────────────────────────────────────────
-    # Search role title, summary, and raw text
+    # ── 1. SENIORITY (28 pts) ────────────────────────────────────────────────
+    # The single most important question: is this entry-level or senior?
+    # We use both keyword matching AND Gemini's extractionConfidence, which the
+    # extraction prompt defines as: High = intern/junior/entry-level,
+    # Medium = mid/senior, Low = unclear. So "High" is a direct entry-level vote.
     search_text = " ".join([
         (doc.get("role")               or ""),
         (doc.get("aiSummary")          or ""),
@@ -158,75 +212,134 @@ def score_signal(doc: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     has_junior = any(kw in search_text for kw in SENIORITY_KEYWORDS)
     has_senior = any(kw in search_text for kw in SENIOR_KEYWORDS)
 
+    # Accept either the DB field name or the raw-item name so this works whether
+    # we're scoring a stored doc or a freshly-extracted item.
+    conf = (doc.get("extractionConfidence") or doc.get("confidence") or "").strip().lower()
+    gemini_entry = conf == "high"
+
     if has_junior and not has_senior:
-        seniority_score = 25
+        seniority_score = 28
         seniority_label = "Intern/Junior confirmed"
+    elif gemini_entry and not has_senior:
+        seniority_score = 25
+        seniority_label = "Entry-level (AI-flagged)"
     elif has_junior and has_senior:
-        # Both keywords — probably a team posting with mixed levels
-        seniority_score = 15
+        seniority_score = 16
         seniority_label = "Mixed seniority signals"
-    elif not has_junior and not has_senior:
-        # No seniority keywords at all — could still be entry level, penalise lightly
-        seniority_score = 10
-        seniority_label = "No seniority keywords"
-    else:
-        # Senior only — still a tech job, just not ideal
+    elif has_senior and gemini_entry:
+        # Word "senior" appears but Gemini still read it as entry-level
+        seniority_score = 14
+        seniority_label = "Conflicting seniority signals"
+    elif has_senior:
         seniority_score = 3
         seniority_label = "Senior-only keywords"
+    else:
+        seniority_score = 12
+        seniority_label = "No seniority keywords"
 
-    breakdown["seniority"] = {"score": seniority_score, "max": 25, "label": seniority_label}
+    breakdown["seniority"] = {"score": seniority_score, "max": 28, "label": seniority_label}
 
-    # ── 3. FRESHNESS (20 pts) ────────────────────────────────────────────────
-    # ONLY use addedAt — it's when WE ingested the signal, always reliable.
-    # postedAt is the source publication date: often months old, sometimes
-    # empty, and has nothing to do with when the user can act on the listing.
+    # ── 2. LOCATION (18 pts) ──────────────────────────────────────────────────
+    # Nigeria is a bonus, but ANY remote role is welcome — "others are ok".
+    loc = (doc.get("location") or "").strip()
+    role_mode = (doc.get("roleMode") or "").strip()
+
+    loc_lower = loc.lower()
+    mode_lower = role_mode.lower()
+
+    is_remote = "remote" in loc_lower or "remote" in mode_lower
+
+    if "nigeria" in loc_lower and is_remote:
+        loc_score = 18
+        loc_label = "Nigeria Remote"
+    elif is_remote:
+        # Remote anywhere is great even without a Nigeria mention.
+        loc_score = 15
+        loc_label = "Remote (non-Nigeria)"
+    elif "nigeria" in loc_lower and "onsite" in loc_lower.replace("-", "").replace(" ", ""):
+        loc_score = 12
+        loc_label = "Nigeria Onsite"
+    elif "nigeria" in loc_lower:
+        loc_score = 11
+        loc_label = "Nigeria (mode unclear)"
+    elif loc in ("", "Unknown"):
+        loc_score = 6
+        loc_label = "Unknown"
+    else:
+        loc_score = 2
+        loc_label = f"Other ({loc})"
+
+    breakdown["location"] = {"score": loc_score, "max": 18, "label": loc_label}
+
+    # ── 3. PAY FIT (14 pts) ───────────────────────────────────────────────────
+    # Intern stipend / modest NGN pay scores well; a "professional" ₦1m+ NGN
+    # salary is a signal this is NOT an entry-level role and scores ~0.
+    # Foreign-currency figures are ambiguous (monthly vs annual, different market
+    # rates) so we stay neutral on them rather than over-penalising remote roles.
+    pay_amount, pay_currency, pay_label = parse_pay(doc.get("pay"))
+    if pay_amount is None:
+        pay_score = 9          # not stated / unparseable — stay neutral
+    elif pay_amount == 0.0:
+        pay_score = 15         # explicit stipend / unpaid intern language
+    elif pay_currency != "NGN":
+        pay_score = 9          # foreign currency — too ambiguous to judge, neutral
+    elif pay_amount < 100_000:
+        pay_score = 14
+    elif pay_amount < 300_000:
+        pay_score = 11
+    elif pay_amount < 600_000:
+        pay_score = 6
+    elif pay_amount < SENIOR_PAY_THRESHOLD:
+        pay_score = 2
+    else:
+        pay_score = 0          # ₦1m+ — professional pay, the user's anti-match
+    breakdown["pay_fit"] = {"score": pay_score, "max": 14, "label": pay_label}
+
+    # ── 4. FRESHNESS (13 pts) ─────────────────────────────────────────────────
+    # Prefer addedAt — it's when WE ingested the signal and what the user can act
+    # on. postedAt (source publication date) is the fallback, and a missing date
+    # is treated as neutral rather than zero so good-but-undated jobs aren't sunk.
     now = datetime.now(timezone.utc)
-    age_days: float = 999.0
+    age_days: Optional[float] = None
 
-    ts = (doc.get("postedAt") or "").strip()
+    ts = (doc.get("addedAt") or doc.get("postedAt") or "").strip()
     if ts:
         try:
             dt = datetime.fromisoformat(ts)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            age_days = (now - dt).total_seconds() / 86400
-            # Sanity-check: future timestamps mean clock skew — treat as 0 days
-            age_days = max(0.0, age_days)
+            age_days = max(0.0, (now - dt).total_seconds() / 86400)
         except Exception:
-            pass  # age_days stays 999 → freshness_score = 0
+            age_days = None
 
-    # Score curve:
-    #   0-1 days  → 20 pts  (just landed)
-    #   1-4 days  → 15-19   (still very fresh — user's sweet spot)
-    #   4-7 days  → 8-14    (getting stale)
-    #   7-14 days → 2-7     (old but still exists)
-    #   > 14 days → 0       (ancient)
-    if age_days <= 1:
-        freshness_score = 20
+    if age_days is None:
+        freshness_score = 8
+        freshness_label = "date unknown — neutral"
+    elif age_days <= 1:
+        freshness_score = 13
         freshness_label = f"{age_days:.1f}d — just added"
     elif age_days <= 4:
-        # Linear 15→19 across 1-4 days
-        freshness_score = round(19 - (age_days - 1) * (4 / 3))
+        freshness_score = round(12 - (age_days - 1) * (2 / 3))   # 12→10
         freshness_label = f"{age_days:.1f}d — very fresh"
     elif age_days <= 7:
-        freshness_score = round(14 - (age_days - 4) * 2)
+        freshness_score = round(9 - (age_days - 4))              # 9→6
         freshness_label = f"{age_days:.1f}d — getting stale"
     elif age_days <= 14:
-        freshness_score = round(8 - (age_days - 7) * (6 / 7))
+        freshness_score = round(5 - (age_days - 7) * (5 / 7))    # 5→0
         freshness_label = f"{age_days:.1f}d — old"
     else:
         freshness_score = 0
         freshness_label = f"{age_days:.1f}d — too old"
 
-    freshness_score = max(0, min(20, freshness_score))
-    breakdown["freshness"] = {"score": freshness_score, "max": 20, "label": freshness_label}
+    freshness_score = max(0, min(13, freshness_score))
+    breakdown["freshness"] = {"score": freshness_score, "max": 13, "label": freshness_label}
 
-    # ── 4. ROLE MODE (10 pts) ────────────────────────────────────────────────
-    mode_map = {"remote": 10, "hybrid": 6, "on-site": 2, "onsite": 2}
-    role_mode_score = mode_map.get(mode_lower, 4)
-    breakdown["role_mode"] = {"score": role_mode_score, "max": 10, "label": role_mode or "Unknown"}
+    # ── 5. ROLE MODE (12 pts) ─────────────────────────────────────────────────
+    mode_map = {"remote": 12, "hybrid": 7, "on-site": 2, "onsite": 2}
+    role_mode_score = mode_map.get(mode_lower, 5)
+    breakdown["role_mode"] = {"score": role_mode_score, "max": 12, "label": role_mode or "Unknown"}
 
-    # ── 5. ROLE TYPE (5 pts) ─────────────────────────────────────────────────
+    # ── 6. ROLE TYPE (5 pts) ─────────────────────────────────────────────────
     rt = (doc.get("roleType") or "Software Engineering").strip()
     role_type_map = {
         "Software Engineering": 5,
@@ -240,17 +353,17 @@ def score_signal(doc: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     role_type_score = role_type_map.get(rt, 3)
     breakdown["role_type"] = {"score": role_type_score, "max": 5, "label": rt}
 
-    # ── 6. APPLICATION STATUS (5 pts) ────────────────────────────────────────
+    # ── 7. APPLICATION STATUS (4 pts) ────────────────────────────────────────
     status = (doc.get("applicationStatus") or "Unknown").strip()
     status_map = {
-        "Open":         5,
-        "Unknown":      3,
-        "Closing soon": 4,  # still valid — just urgent
+        "Open":         4,
+        "Unknown":      2,
+        "Closing soon": 3,  # still valid — just urgent
     }
-    status_score = status_map.get(status, 3)
-    breakdown["status"] = {"score": status_score, "max": 5, "label": status}
+    status_score = status_map.get(status, 2)
+    breakdown["status"] = {"score": status_score, "max": 4, "label": status}
 
-    # ── 7. RICHNESS / DATA QUALITY (3 pts) ───────────────────────────────────
+    # ── 8. RICHNESS / DATA QUALITY (3 pts) ───────────────────────────────────
     tags = doc.get("skillTags") or []
     n_tags = len([t for t in tags if t and t.strip()])
     if n_tags >= 5:
@@ -263,16 +376,17 @@ def score_signal(doc: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         richness_score = 0
     breakdown["richness"] = {"score": richness_score, "max": 3, "label": f"{n_tags} tags"}
 
-    # ── 8. SOURCE CONFIDENCE (2 pts) ─────────────────────────────────────────
+    # ── 9. SOURCE CONFIDENCE (3 pts) ─────────────────────────────────────────
     sc = (doc.get("sourceConfidence") or "Medium").strip()
-    source_map = {"High": 2, "Medium": 1, "Low": 0}
-    source_score = source_map.get(sc, 1)
-    breakdown["source"] = {"score": source_score, "max": 2, "label": sc}
+    source_map = {"High": 3, "Medium": 2, "Low": 0}
+    source_score = source_map.get(sc, 2)
+    breakdown["source"] = {"score": source_score, "max": 3, "label": sc}
 
-    # ── TOTAL ─────────────────────────────────────────────────────────────────
+    # ── WEIGHTED BASE ──────────────────────────────────────────────────────────
     total = (
-        loc_score
-        + seniority_score
+        seniority_score
+        + loc_score
+        + pay_score
         + freshness_score
         + role_mode_score
         + role_type_score
@@ -280,6 +394,29 @@ def score_signal(doc: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         + richness_score
         + source_score
     )
+
+    # ── LEVEL PENALTY ──────────────────────────────────────────────────────────
+    # A clearly senior / "professional" role (senior keywords, or ₦1m+ pay with
+    # no junior signal) is the user's explicit anti-match. The weighted base alone
+    # can't sink it — a senior role can still be remote, Nigerian, and fresh — so
+    # we subtract a flat penalty AND hard-cap the ₦1m+ case to force it below 50.
+    is_senior_pay = (
+        pay_amount is not None
+        and pay_currency == "NGN"
+        and pay_amount >= SENIOR_PAY_THRESHOLD
+        and not has_junior
+        and not gemini_entry
+    )
+    is_senior = (has_senior and not has_junior and not gemini_entry) or is_senior_pay
+
+    if is_senior:
+        penalty = 30
+        total -= penalty
+        reason = "senior keywords" if (has_senior and not is_senior_pay) else "professional pay"
+        breakdown["level_penalty"] = {"score": -penalty, "max": 0, "label": f"senior role ({reason})"}
+        if is_senior_pay:
+            total = min(total, 35)   # ₦1m+ never reads as a match
+
     total = max(0, min(100, total))
 
     breakdown["TOTAL"] = total
@@ -390,45 +527,45 @@ if __name__ == "__main__":
 
     if args.demo:
         # ── Quick sanity-check without needing MongoDB ────────────────────
+        now_iso  = datetime.now(timezone.utc).isoformat()
+        days_ago = lambda n: (datetime.now(timezone.utc) - timedelta(days=n)).isoformat()
         examples = [
             {
-                "name": "🏆 Perfect: Nigeria Remote Intern, 1 day old",
+                "name": "🏆 Perfect: Nigeria Remote Intern, stipend, 1 day old",
                 "doc": {
                     "location": "Nigeria Remote", "roleMode": "Remote",
                     "roleType": "Software Engineering", "applicationStatus": "Open",
-                    "addedAt": datetime.now(timezone.utc).isoformat(),
+                    "addedAt": now_iso, "pay": "₦80,000 monthly stipend",
                     "role": "Frontend Intern", "aiSummary": "Junior internship for fresh grads",
                     "originalSourceText": "We are hiring an intern to join our team",
                     "skillTags": ["React", "TypeScript", "CSS", "Git", "Node.js"],
-                    "sourceConfidence": "High",
+                    "extractionConfidence": "High", "sourceConfidence": "High",
                 },
             },
             {
-                "name": "🥈 Good: Nigeria Remote but senior, 2 days old",
-                "doc": {
-                    "location": "Nigeria Remote", "roleMode": "Remote",
-                    "roleType": "Software Engineering", "applicationStatus": "Open",
-                    "addedAt": (datetime.now(timezone.utc).replace(
-                        hour=datetime.now().hour - 48 % 24
-                    )).isoformat(),
-                    "role": "Senior Backend Engineer",
-                    "aiSummary": "Senior role, 5+ years required",
-                    "originalSourceText": "Senior developer needed with 7 years experience",
-                    "skillTags": ["Python", "Django", "PostgreSQL"],
-                    "sourceConfidence": "High",
-                },
-            },
-            {
-                "name": "🥉 OK: Remote (non-Nigeria) Junior, 3 days old",
+                "name": "🥈 OK (others welcome): Remote non-Nigeria Junior, 3 days old",
                 "doc": {
                     "location": "Remote", "roleMode": "Remote",
                     "roleType": "Software Engineering", "applicationStatus": "Open",
-                    "addedAt": (datetime.now(timezone.utc).isoformat()),
+                    "addedAt": days_ago(3), "pay": "$1,200/month",
                     "role": "Junior React Developer",
                     "aiSummary": "Entry-level position for new grads",
                     "originalSourceText": "We are hiring entry level developers",
                     "skillTags": ["React", "JavaScript"],
-                    "sourceConfidence": "Medium",
+                    "extractionConfidence": "High", "sourceConfidence": "Medium",
+                },
+            },
+            {
+                "name": "🚫 Anti-match: Nigeria Remote 'professional' ₦1.5m, fresh",
+                "doc": {
+                    "location": "Nigeria Remote", "roleMode": "Remote",
+                    "roleType": "Software Engineering", "applicationStatus": "Open",
+                    "addedAt": now_iso, "pay": "₦1,500,000 per month",
+                    "role": "Backend Engineer",
+                    "aiSummary": "Experienced engineer for a fast-growing fintech",
+                    "originalSourceText": "We are hiring an experienced backend engineer",
+                    "skillTags": ["Python", "Django", "PostgreSQL"],
+                    "extractionConfidence": "Medium", "sourceConfidence": "High",
                 },
             },
             {
@@ -436,12 +573,12 @@ if __name__ == "__main__":
                 "doc": {
                     "location": "San Francisco, CA", "roleMode": "On-site",
                     "roleType": "Software Engineering", "applicationStatus": "Closing soon",
-                    "addedAt": "2025-05-01T00:00:00+00:00",
+                    "addedAt": days_ago(20), "pay": "$180,000 / year",
                     "role": "Principal Engineer",
                     "aiSummary": "Lead engineer needed",
                     "originalSourceText": "Seeking a principal engineer with 10+ years",
                     "skillTags": ["Go", "Kubernetes"],
-                    "sourceConfidence": "Low",
+                    "extractionConfidence": "Medium", "sourceConfidence": "Low",
                 },
             },
         ]

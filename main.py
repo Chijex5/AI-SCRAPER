@@ -23,7 +23,7 @@ from google import genai
 from telethon import TelegramClient
 from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
 from telethon.sessions import StringSession
-from score import score_signal
+from score import score_signal, SENIORITY_KEYWORDS, SENIOR_KEYWORDS
 
 
 load_dotenv()
@@ -571,13 +571,12 @@ def item_to_doc(item: dict) -> dict:
     source_confidence     = _conf(source_confidence_raw)
 
     # ── Derived / computed fields ─────────────────────────────────────────────
-    ai_match_score, breakdown  = score_signal(item)
     ai_summary        = notes or _truncate(raw_text, 220) or "No summary available."
     source_post_prev  = _truncate(raw_text, 280)
     source_handle     = channel or username or source
     source_metadata   = [s for s in [source, channel, username, location_raw] if s and s != "Unknown"]
 
-    return {
+    doc = {
         # ── Identity ──────────────────────────────────────────────────────────
         "scrapedId":           build_scraped_id(item),
         "platform":            source,
@@ -588,7 +587,7 @@ def item_to_doc(item: dict) -> dict:
         "role":                role,
         "company":             company,
         "location":            location_raw,
-        "aiMatchScore":        ai_match_score,
+        "aiMatchScore":        0,          # set below, after the doc is assembled
         "postedAt":            str(item.get("created_at") or ""),
         "aiSummary":           ai_summary,
         "skillTags":           skill_tags,
@@ -604,12 +603,18 @@ def item_to_doc(item: dict) -> dict:
         "sourceConfidence":    source_confidence,
         "originalSourceText":  raw_text,
         "sourceMetadata":      source_metadata,
-        "relatedIds":          [],          # populated post-insert if needed
+        "relatedIds":          [],          # manual curation only; GET /related computes matches on read
 
         # ── Extras ────────────────────────────────────────────────────────────
         "pay":       pay,
         "applyLink": apply_link,
     }
+
+    # Score the fully-normalised doc (DB field names) — NOT the raw Gemini item,
+    # whose keys (position/role_mode/notes/created_at/skill_tags…) don't match
+    # what score_signal reads, which silently zeroed out most components.
+    doc["aiMatchScore"], _ = score_signal(doc)
+    return doc
 
 
 def doc_to_signal(doc: dict) -> IntelligenceSignal:
@@ -2074,18 +2079,106 @@ async def get_signal(id: str):
     return doc_to_signal(doc)
 
 
+# ── RELATEDNESS (content-based, computed on read) ───────────────────────────────
+# Two signals are "related" when they point at the same kind of opportunity. We
+# score it from data we already extract — no embeddings, no new storage — so the
+# result is always fresh and never references signals the 30-day cleanup removed.
+RELATED_POOL_LIMIT = 250   # most-recent candidates to score per request
+RELATED_MIN_SCORE  = 12    # below this, treat as unrelated (drop)
+
+
+def _norm_tags(tags: Any) -> set[str]:
+    return {t.strip().lower() for t in (tags or []) if t and t.strip()}
+
+
+def _seniority_tier(doc: dict) -> str:
+    """'junior' | 'senior' | 'unknown' from keywords + Gemini's confidence vote."""
+    text = " ".join([
+        doc.get("role") or "", doc.get("aiSummary") or "",
+        doc.get("originalSourceText") or "",
+    ]).lower()
+    has_junior = any(kw in text for kw in SENIORITY_KEYWORDS)
+    has_senior = any(kw in text for kw in SENIOR_KEYWORDS)
+    if (doc.get("extractionConfidence") or "").strip().lower() == "high":
+        has_junior = True
+    if has_junior and not has_senior:
+        return "junior"
+    if has_senior and not has_junior:
+        return "senior"
+    return "unknown"
+
+
+def relatedness(source: dict, cand: dict) -> float:
+    """0-100 similarity between two signal docs. Higher = more related."""
+    score = 0.0
+
+    a, b = _norm_tags(source.get("skillTags")), _norm_tags(cand.get("skillTags"))
+    if a and b:
+        shared = a & b
+        jaccard = len(shared) / len(a | b)
+        score += jaccard * 50                       # tag overlap is the main driver
+        score += min(len(shared), 4) * 5            # reward absolute overlap (≤ +20)
+
+    comp = (source.get("company") or "").strip().lower()
+    if comp and comp not in ("unknown", "") and comp == (cand.get("company") or "").strip().lower():
+        score += 25                                 # other openings at the same company
+
+    if (source.get("roleType") or "").strip() == (cand.get("roleType") or "").strip():
+        score += 15
+
+    src_tier, cand_tier = _seniority_tier(source), _seniority_tier(cand)
+    if src_tier != "unknown" and cand_tier != "unknown":
+        score += 10 if src_tier == cand_tier else -15   # keep interns with interns,
+                                                        # push senior↔junior matches down
+
+    if (source.get("roleMode") or "").strip() == (cand.get("roleMode") or "").strip():
+        score += 5
+
+    return score
+
+
 # ── GET /signals/{id}/related ───────────────────────────────────────────────────
 @app.get("/signals/{id}/related", response_model=list[IntelligenceSignal])
-async def get_related_signals(id: str):
+async def get_related_signals(id: str, limit: int = Query(default=6, ge=1, le=20)):
     col = get_signals()
-    doc = await col.find_one({"_id": valid_object_id(id)}, {"relatedIds": 1})
-    if not doc:
+    oid = valid_object_id(id)
+    source = await col.find_one({"_id": oid})
+    if not source:
         raise HTTPException(status_code=404, detail="Signal not found.")
-    related_ids = doc.get("relatedIds", [])
-    if not related_ids:
-        return []
-    related_docs = await col.find({"_id": {"$in": [valid_object_id(rid) for rid in related_ids]}}).to_list(length=len(related_ids))
-    return [doc_to_signal(d) for d in related_docs]
+
+    ranked: list[tuple[float, dict]] = []
+    seen: set = {oid}
+
+    # 1. Manually curated links (via PATCH) always come first, if still present.
+    curated_ids = [valid_object_id(r) for r in source.get("relatedIds", []) if r]
+    if curated_ids:
+        async for doc in col.find({"_id": {"$in": curated_ids}}):
+            ranked.append((float("inf"), doc))
+            seen.add(doc["_id"])
+
+    # 2. Computed matches: prefilter to a recent pool that shares SOMETHING, then
+    #    score and keep the strongest. roleType is indexed; the $or keeps it cheap.
+    tags = list(_norm_tags(source.get("skillTags")))
+    prefilter: dict = {"_id": {"$ne": oid}, "$or": [
+        {"roleType": source.get("roleType")},
+        {"company":  source.get("company")},
+    ]}
+    if tags:
+        prefilter["$or"].append({"skillTags": {"$in": source.get("skillTags", [])}})
+
+    computed: list[tuple[float, dict]] = []
+    cursor = col.find(prefilter).sort("addedAt", -1).limit(RELATED_POOL_LIMIT)
+    async for cand in cursor:
+        if cand["_id"] in seen:
+            continue
+        s = relatedness(source, cand)
+        if s >= RELATED_MIN_SCORE:
+            computed.append((s, cand))
+
+    computed.sort(key=lambda x: x[0], reverse=True)
+    ranked.extend(computed)
+
+    return [doc_to_signal(d) for _, d in ranked[:limit]]
 
 # ── PATCH /signals/{id} ───────────────────────────────────────────────────────
 @app.patch("/signals/{signal_id}", response_model=IntelligenceSignal)
