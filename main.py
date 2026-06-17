@@ -677,6 +677,17 @@ TELEGRAM_ROLE_KEYWORDS = [
     "apply", "application",
 ]
 
+BLUESKY_QUERIES = [
+    "#NigeriaJobs #hiring",
+    "#RemoteJobs developer Nigeria",
+    "#TechJobs #hiring remote",
+    "#hiring #javascript remote",
+    "#hiring #python remote",
+    "#hiring #react remote",
+    "#softwareengineer remote #hiring",
+    "#Hiring software engineer Africa",
+]
+
 
 async def fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
     listings: list[dict] = []
@@ -859,64 +870,154 @@ async def fetch_himalayas(client: httpx.AsyncClient) -> list[dict]:
     print(f"  ↳ Himalayas: {len(listings)}")
     return listings
 
+
+async def fetch_remoteok(client: httpx.AsyncClient) -> list[dict]:
+    listings: list[dict] = []
+    seen: set[str] = set()
+    try:
+        resp = await client.get(
+            "https://remoteok.com/api",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        jobs = resp.json()
+        for job in jobs[1:]:  # index 0 is a legal header object
+            jid = str(job.get("id", ""))
+            if not jid or jid in seen:
+                continue
+            tags = job.get("tags") or []
+            position = job.get("position", "")
+            description = BeautifulSoup(job.get("description", ""), "html.parser").get_text()
+            combined = f"{position} {' '.join(tags)} {description}".lower()
+            if not any(kw in combined for kw in ROLE_KEYWORDS):
+                continue
+            seen.add(jid)
+            listings.append({
+                "id":         jid,
+                "source":     "RemoteOK",
+                "text": (
+                    f"{position} at {job.get('company', 'Unknown')}\n"
+                    f"Location: Remote\n"
+                    f"Tags: {', '.join(tags)}\n"
+                    f"{description[:400]}"
+                ),
+                "created_at": job.get("date", ""),
+                "url":        job.get("url", ""),
+                "user":       job.get("company", "Unknown"),
+                "username":   "remoteok",
+            })
+    except Exception as e:
+        print(f"  ⚠  RemoteOK: {e}")
+    print(f"  ↳ RemoteOK: {len(listings)}")
+    return listings
+
+
+async def fetch_bluesky(client: httpx.AsyncClient) -> list[dict]:
+    listings: list[dict] = []
+    seen: set[str] = set()
+    for query in BLUESKY_QUERIES:
+        try:
+            resp = await client.get(
+                "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts",
+                params={"q": query, "limit": 100},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for post in resp.json().get("posts", []):
+                uri  = post.get("uri", "")
+                text = (post.get("record") or {}).get("text", "")
+                if not uri or not text or uri in seen:
+                    continue
+                if not any(kw in text.lower() for kw in TELEGRAM_ROLE_KEYWORDS):
+                    continue
+                seen.add(uri)
+                author  = post.get("author", {})
+                handle  = author.get("handle", "bsky.social")
+                rkey    = uri.split("/")[-1]
+                listings.append({
+                    "id":         uri,
+                    "source":     "Bluesky",
+                    "text":       text[:1000],
+                    "created_at": post.get("indexedAt", ""),
+                    "url":        f"https://bsky.app/profile/{handle}/post/{rkey}",
+                    "user":       author.get("displayName", handle),
+                    "username":   handle,
+                })
+        except Exception as e:
+            print(f"  ⚠  Bluesky [{query}]: {e}")
+        await asyncio.sleep(0.5)
+    print(f"  ↳ Bluesky: {len(listings)}")
+    return listings
+
+
 async def fetch_telegram() -> list[dict]:
     if not (TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_PHONE):
         print("  ↳ Telegram: skipped (credentials not set)")
         return []
- 
+
+    if not SESSION_STRING:
+        print("  ↳ Telegram: skipped (SESSION_STRING not set — run scraper.py to generate one)")
+        return []
+
     channels = await get_active_channels()
     if not channels:
         print("  ↳ Telegram: no active channels")
         return []
- 
+
     listings: list[dict] = []
     seen:     set[str]   = set()
- 
+
     tg = TelegramClient(
         StringSession(SESSION_STRING),
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
     )
-    await tg.start(phone=TELEGRAM_PHONE)
- 
-    for i, channel in enumerate(channels):
-        # ── update global progress state ─────────────────────────────────
-        scrape_state["current_source"] = f"Telegram @{channel}"
-        # telegram channels are the last phase; map i → overall progress 70-95
-        tg_progress = 70 + int((i / max(len(channels), 1)) * 25)
-        scrape_state["progress"] = tg_progress
- 
-        try:
-            entity   = await tg.get_entity(channel)
-            messages = await tg.get_messages(entity, limit=100)
-            found    = 0
-            for msg in messages:
-                if not msg.text:
-                    continue
-                if not any(kw in msg.text.lower() for kw in TELEGRAM_ROLE_KEYWORDS):
-                    continue
-                mid = f"{channel}_{msg.id}"
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                found += 1
-                listings.append({
-                    "id":         mid,
-                    "source":     "Telegram",
-                    "channel":    channel,
-                    "text":       msg.text[:1000],
-                    "created_at": msg.date.isoformat() if msg.date else "",
-                    "url":        f"https://t.me/{channel}/{msg.id}",
-                    "user":       channel,
-                    "username":   channel,
-                })
-            print(f"    • @{channel}: {found}")
-        except (ChannelInvalidError, UsernameNotOccupiedError):
-            print(f"    ⚠  @{channel}: not found / private")
-        except Exception as e:
-            print(f"    ⚠  @{channel}: {e}")
- 
-    await tg.disconnect()
+    try:
+        await tg.start(phone=TELEGRAM_PHONE)
+    except Exception as auth_err:
+        print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew TELEGRAM_SESSION_STRING to fix.")
+        return []
+
+    try:
+        for i, channel in enumerate(channels):
+            scrape_state["current_source"] = f"Telegram @{channel}"
+            tg_progress = 70 + int((i / max(len(channels), 1)) * 25)
+            scrape_state["progress"] = tg_progress
+
+            try:
+                entity   = await tg.get_entity(channel)
+                messages = await tg.get_messages(entity, limit=100)
+                found    = 0
+                for msg in messages:
+                    if not msg.text:
+                        continue
+                    if not any(kw in msg.text.lower() for kw in TELEGRAM_ROLE_KEYWORDS):
+                        continue
+                    mid = f"{channel}_{msg.id}"
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    found += 1
+                    listings.append({
+                        "id":         mid,
+                        "source":     "Telegram",
+                        "channel":    channel,
+                        "text":       msg.text[:1000],
+                        "created_at": msg.date.isoformat() if msg.date else "",
+                        "url":        f"https://t.me/{channel}/{msg.id}",
+                        "user":       channel,
+                        "username":   channel,
+                    })
+                print(f"    • @{channel}: {found}")
+            except (ChannelInvalidError, UsernameNotOccupiedError):
+                print(f"    ⚠  @{channel}: not found / private")
+            except Exception as e:
+                print(f"    ⚠  @{channel}: {e}")
+    finally:
+        await tg.disconnect()
+
     print(f"  ↳ Telegram: {len(listings)}")
     return listings
 
@@ -927,6 +1028,8 @@ async def scrape_all() -> list[dict]:
             fetch_jobberman(client),
             fetch_myjobmag(client),
             fetch_himalayas(client),
+            fetch_remoteok(client),
+            fetch_bluesky(client),
         )
     tg = await fetch_telegram()
     combined: list[dict] = []
@@ -1247,6 +1350,8 @@ async def run_scrape_pipeline() -> dict[str, int]:
             ("Jobberman", fetch_jobberman),
             ("MyJobMag",  fetch_myjobmag),
             ("Himalayas", fetch_himalayas),
+            ("RemoteOK",  fetch_remoteok),
+            ("Bluesky",   fetch_bluesky),
         ]
         web_results: list[list[dict]] = []
         async with httpx.AsyncClient() as client:
@@ -1733,6 +1838,34 @@ async def generate_notifications_pipeline() -> int:
  
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLEANUP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_CLEANUP_PROTECTED_STATUSES = {"saved", "applied", "interviewing", "offered", "rejected"}
+
+
+async def cleanup_old_signals(days: int = 30) -> dict[str, int]:
+    """Delete unactioned signals and old notifications older than `days` days."""
+    cutoff    = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    sig_col   = get_signals()
+    notif_col = get_notifications_col()
+
+    sig_result = await sig_col.delete_many({
+        "addedAt": {"$lt": cutoff},
+        "status":  {"$nin": list(_CLEANUP_PROTECTED_STATUSES)},
+    })
+    notif_result = await notif_col.delete_many({"generatedAt": {"$lt": cutoff}})
+
+    print(
+        f"🧹 Cleanup: {sig_result.deleted_count} old signals, "
+        f"{notif_result.deleted_count} old notifications removed (cutoff: {cutoff[:10]})"
+    )
+    return {
+        "signals_deleted":       sig_result.deleted_count,
+        "notifications_deleted": notif_result.deleted_count,
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # APP + SCHEDULER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 scheduler = AsyncIOScheduler(timezone="Africa/Lagos")
@@ -1758,9 +1891,20 @@ async def lifespan(app: FastAPI):
         id="weekly_notifications",
         replace_existing=True,
     )
+    scheduler.add_job(
+        cleanup_old_signals,
+        trigger="cron",
+        day_of_week="mon",   # Monday at 3 AM — after Sunday notifications, before morning usage
+        hour=3,
+        minute=0,
+        id="weekly_cleanup",
+        replace_existing=True,
+    )
     scheduler.start()
     notif_next = scheduler.get_job("weekly_notifications").next_run_time
     print(f"🔔 Notification cron — next run: {notif_next.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    cleanup_next = scheduler.get_job("weekly_cleanup").next_run_time
+    print(f"🧹 Cleanup cron — next run: {cleanup_next.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
     next_run = scheduler.get_job("daily_scrape").next_run_time
     print(f"⏰ Cron scheduled — next run: {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}")
@@ -1967,6 +2111,19 @@ async def update_signal_status(signal_id: str, body: StatusUpdate):
         raise HTTPException(status_code=404, detail="Signal not found.")
 
     return doc_to_signal(updated)
+
+# ── DELETE /signals/cleanup ───────────────────────────────────────────────────
+@app.delete("/signals/cleanup")
+async def manual_cleanup(days: int = Query(default=30, ge=1, le=365)):
+    """Delete unactioned signals and notifications older than `days` days."""
+    result = await cleanup_old_signals(days=days)
+    return {
+        "message":              "Cleanup complete.",
+        "signalsDeleted":       result["signals_deleted"],
+        "notificationsDeleted": result["notifications_deleted"],
+        "olderThanDays":        days,
+    }
+
 
 # ── DELETE /signals/{id} ──────────────────────────────────────────────────────
 @app.delete("/signals/{id}")
