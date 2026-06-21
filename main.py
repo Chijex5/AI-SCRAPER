@@ -1528,7 +1528,8 @@ async def run_scrape_pipeline() -> dict[str, int]:
         scrape_state["progress"]      = 40
         scrape_state["current_source"] = "Telegram channels"
         tg = await fetch_telegram()  # updates progress 40→70 internally
- 
+        await record_source_health("Telegram", len(tg))
+
         # ── combine & dedupe ──────────────────────────────────────────────
         scrape_state["progress"] = 70
         combined: list[dict] = []
