@@ -572,7 +572,9 @@ async def _generate_ai_insight(signals: list[dict], now: datetime) -> dict:
  
     try:
         client, _ = _next_client()
-        resp  = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp  = await asyncio.to_thread(
+            client.models.generate_content, model="gemini-2.5-flash", contents=prompt
+        )
         raw   = resp.text.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -1334,7 +1336,7 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
     prompt   = GEMINI_PROMPT + numbered
     n_keys   = len(_gemini_clients)
 
-    def _try_all_keys() -> list[dict] | None:
+    async def _try_all_keys() -> list[dict] | None:
         """
         Attempt every key once. Returns parsed results on first success,
         or None if every key failed with a retriable error.
@@ -1344,7 +1346,12 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
             client, idx = _next_client()
             key_label   = f"key {idx + 1}/{n_keys}"
             try:
-                response = client.models.generate_content(
+                # google-genai's generate_content is a blocking call — running it
+                # directly here would freeze the whole event loop (and with it,
+                # health checks + the scheduler) for the duration of every Gemini
+                # request. asyncio.to_thread keeps the loop free while it runs.
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
                     model="gemini-3.1-flash-lite",
                     contents=prompt,
                     config=genai_types.GenerateContentConfig(
@@ -1375,7 +1382,7 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
 
     while True:
         try:
-            result = _try_all_keys()
+            result = await _try_all_keys()
         except (json.JSONDecodeError, ValidationError):
             return []   # unrecoverable — skip this batch silently
 
@@ -2605,36 +2612,136 @@ _TELEGRAM_RENEW_PAGE = """
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Renew Telegram session</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 60px auto; }
-    label { display: block; margin-top: 12px; font-size: 14px; }
-    input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
-    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
+    :root {
+      --tg-blue: #2AABEE;
+      --tg-blue-dark: #229ED9;
+      --bg: #0f1720;
+      --card: #1a2530;
+      --text: #e8edf2;
+      --muted: #8b9cad;
+      --border: #2a3a48;
+      --ok: #3ddc84;
+      --err: #ff6868;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #16222c, var(--bg) 65%);
+      color: var(--text);
+      min-height: 100vh;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 28px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+    .header svg { flex: none; }
+    h1 { font-size: 18px; font-weight: 600; margin: 0; }
+    .subtitle { color: var(--muted); font-size: 13px; margin: 6px 0 24px; line-height: 1.5; }
+    .steps { display: flex; gap: 8px; margin-bottom: 24px; }
+    .steps .dot {
+      flex: 1; height: 4px; border-radius: 2px; background: var(--border);
+      transition: background 0.25s;
+    }
+    .steps .dot.active { background: var(--tg-blue); }
+    label {
+      display: block; font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+      color: var(--muted); text-transform: uppercase; margin-top: 18px; margin-bottom: 6px;
+    }
+    label:first-of-type { margin-top: 0; }
+    input {
+      width: 100%; padding: 11px 12px; font-size: 14px; color: var(--text);
+      background: #0f1720; border: 1px solid var(--border); border-radius: 8px;
+      outline: none; transition: border-color 0.15s;
+    }
+    input::placeholder { color: #5a6b7a; }
+    input:focus { border-color: var(--tg-blue); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    button {
+      width: 100%; margin-top: 22px; padding: 12px 16px; font-size: 14px; font-weight: 600;
+      color: #fff; background: linear-gradient(135deg, var(--tg-blue), var(--tg-blue-dark));
+      border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.15s, transform 0.05s;
+    }
+    button:hover { opacity: 0.92; }
+    button:active { transform: scale(0.99); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary {
+      background: transparent; border: 1px solid var(--border); color: var(--muted); margin-top: 10px;
+    }
+    button.secondary:hover { color: var(--text); border-color: var(--muted); }
     #step2 { display: none; }
-    #msg { margin-top: 16px; font-size: 14px; white-space: pre-wrap; }
+    #msg {
+      margin-top: 18px; font-size: 13px; line-height: 1.5; white-space: pre-wrap;
+      border-radius: 8px; padding: 0; transition: padding 0.15s;
+    }
+    #msg:not(:empty) { padding: 10px 12px; background: #0f1720; border: 1px solid var(--border); }
+    #msg.ok { color: var(--ok); border-color: var(--ok); }
+    #msg.err { color: var(--err); border-color: var(--err); }
   </style>
 </head>
 <body>
-  <h2>Renew Telegram session</h2>
+  <div class="card">
+    <div class="header">
+      <svg width="28" height="28" viewBox="0 0 240 240" fill="none">
+        <circle cx="120" cy="120" r="120" fill="#2AABEE"/>
+        <path d="M170 72l-22 110c-1.6 7.5-6 9.3-12.2 5.8l-33.8-25-16.3 15.7c-1.8 1.8-3.3 3.3-6.8 3.3l2.4-34.7L156 86.4c3.3-2.9-.7-4.6-4.2-1.6l-67.5 42.5-29-9.1c-6.3-2-6.4-6.3 1.4-9.3l113.4-43.7c5.2-2 9.8 1.2 8 9.8z" fill="#fff"/>
+      </svg>
+      <h1>Renew Telegram session</h1>
+    </div>
+    <p class="subtitle">Re-authenticate the scraper's Telegram account. The code is sent straight to your phone — enter it below to finish.</p>
 
-  <label>Admin token <input id="token" type="password"></label>
+    <div class="steps">
+      <div class="dot active" id="dot1"></div>
+      <div class="dot" id="dot2"></div>
+    </div>
 
-  <div id="step1">
-    <label>Phone (e.g. +234...) <input id="phone" type="text"></label>
-    <button id="sendCodeBtn">Send Code</button>
+    <label>Admin token</label>
+    <input id="token" type="password" placeholder="••••••••••••">
+
+    <div id="step1">
+      <label>Phone number</label>
+      <input id="phone" type="text" placeholder="+234...">
+      <button id="sendCodeBtn">Send Code</button>
+    </div>
+
+    <div id="step2">
+      <label>Verification code</label>
+      <input id="code" type="text" placeholder="12345" inputmode="numeric">
+      <label>2FA password <span class="hint" style="display:inline;text-transform:none;font-weight:400;">(only if Telegram asks)</span></label>
+      <input id="password" type="password" placeholder="Optional">
+      <button id="completeBtn">Complete</button>
+      <button id="restartBtn" class="secondary" type="button">Start over</button>
+    </div>
+
+    <div id="msg"></div>
   </div>
-
-  <div id="step2">
-    <label>Code <input id="code" type="text"></label>
-    <label>2FA password (only if asked) <input id="password" type="password"></label>
-    <button id="completeBtn">Complete</button>
-  </div>
-
-  <div id="msg"></div>
 
   <script>
     let renewalId = null;
+    const msgEl = document.getElementById("msg");
+
+    function setMsg(text, kind) {
+      msgEl.textContent = text;
+      msgEl.className = kind || "";
+    }
+
+    function setBusy(btn, busy, label) {
+      btn.disabled = busy;
+      btn.textContent = busy ? label : btn.dataset.label;
+    }
 
     async function call(path, body) {
       const res = await fetch(path, {
@@ -2650,34 +2757,52 @@ _TELEGRAM_RENEW_PAGE = """
       return data;
     }
 
-    document.getElementById("sendCodeBtn").onclick = async () => {
-      const msg = document.getElementById("msg");
-      msg.textContent = "Sending code...";
+    const sendCodeBtn = document.getElementById("sendCodeBtn");
+    sendCodeBtn.dataset.label = sendCodeBtn.textContent;
+    sendCodeBtn.onclick = async () => {
+      setBusy(sendCodeBtn, true, "Sending…");
+      setMsg("");
       try {
         const data = await call("/admin/telegram/renew/start", {
           phone: document.getElementById("phone").value,
         });
         renewalId = data.renewal_id;
         document.getElementById("step2").style.display = "block";
-        msg.textContent = "Code sent — check your phone.";
+        document.getElementById("dot2").classList.add("active");
+        setMsg("Code sent — check your phone.", "ok");
       } catch (e) {
-        msg.textContent = "Error: " + e.message;
+        setMsg("Error: " + e.message, "err");
+      } finally {
+        setBusy(sendCodeBtn, false);
       }
     };
 
-    document.getElementById("completeBtn").onclick = async () => {
-      const msg = document.getElementById("msg");
-      msg.textContent = "Completing...";
+    const completeBtn = document.getElementById("completeBtn");
+    completeBtn.dataset.label = completeBtn.textContent;
+    completeBtn.onclick = async () => {
+      setBusy(completeBtn, true, "Verifying…");
       try {
         await call("/admin/telegram/renew/complete", {
           renewal_id: renewalId,
           code: document.getElementById("code").value,
           password: document.getElementById("password").value || null,
         });
-        msg.textContent = "✓ Session renewed. Telegram fetches will use it on the next run.";
+        setMsg("✓ Session renewed. Telegram fetches will use it on the next run.", "ok");
       } catch (e) {
-        msg.textContent = "Error: " + e.message + " — you can retry the code above.";
+        setMsg("Error: " + e.message + " — you can retry the code above.", "err");
+      } finally {
+        setBusy(completeBtn, false);
       }
+    };
+
+    document.getElementById("restartBtn").onclick = () => {
+      renewalId = null;
+      document.getElementById("step2").style.display = "none";
+      document.getElementById("dot2").classList.remove("active");
+      document.getElementById("code").value = "";
+      document.getElementById("password").value = "";
+      document.getElementById("phone").value = "";
+      setMsg("");
     };
   </script>
 </body>
