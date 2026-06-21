@@ -2,20 +2,19 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pymongo import ReturnDocument
 from typing import Any, Optional
-from datetime import datetime, timedelta, timezone   # ← add timedelta
-import hashlib                      
-from health import router as health_router           
+import hashlib
+from health import router as health_router
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from bson import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 from pydantic import BaseModel, ValidationError
@@ -53,6 +52,14 @@ TELEGRAM_API_ID   = int(os.getenv("TELEGRAM_API_ID",   "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH",     "")
 TELEGRAM_PHONE    = os.getenv("TELEGRAM_PHONE",        "")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+async def require_admin(x_admin_token: str = Header(default="")) -> None:
+    """Guards the Telegram session-renewal endpoints — the only auth in this app."""
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 BATCH_SIZE = 8   # smaller — richer prompt = more tokens per item
@@ -313,8 +320,31 @@ def get_channels_col():
     if db.client is None:
         raise RuntimeError("Database not initialised")
     return db.client[DB_NAME]["telegram_channels"]
- 
- 
+
+
+def get_config_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["app_config"]
+
+
+async def get_session_string() -> str:
+    """Mongo holds the live, renewable session string; the env var is only
+    the bootstrap fallback for a brand-new deployment with nothing saved yet."""
+    col = get_config_col()
+    doc = await col.find_one({"_id": "telegram_session"})
+    return doc["value"] if doc else SESSION_STRING
+
+
+async def save_session_string(value: str) -> None:
+    col = get_config_col()
+    await col.update_one(
+        {"_id": "telegram_session"},
+        {"$set": {"value": value, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
 async def seed_channels_if_empty():
     """On first boot, populate the channels collection from the hardcoded seed list."""
     col = get_channels_col()
@@ -1041,8 +1071,9 @@ async def fetch_telegram() -> list[dict]:
         print("  ↳ Telegram: skipped (credentials not set)")
         return []
 
-    if not SESSION_STRING:
-        print("  ↳ Telegram: skipped (SESSION_STRING not set — run scraper.py to generate one)")
+    session_string = await get_session_string()
+    if not session_string:
+        print("  ↳ Telegram: skipped (no session string saved — use /admin/telegram/renew)")
         return []
 
     channels = await get_active_channels()
@@ -1054,7 +1085,7 @@ async def fetch_telegram() -> list[dict]:
     seen:     set[str]   = set()
 
     tg = TelegramClient(
-        StringSession(SESSION_STRING),
+        StringSession(session_string),
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
     )
@@ -1071,13 +1102,13 @@ async def fetch_telegram() -> list[dict]:
     ) as auth_err:
         msg = (
             f"⚠ Telegram session is dead ({type(auth_err).__name__}: {auth_err}) — "
-            f"re-run scraper.py and update TELEGRAM_SESSION_STRING."
+            f"renew it at /admin/telegram/renew."
         )
         print(f"  ↳ {msg}")
         await log_event(msg, "error")
         return []
     except Exception as auth_err:
-        print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew TELEGRAM_SESSION_STRING to fix.")
+        print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew it at /admin/telegram/renew.")
         return []
 
     try:
@@ -2482,6 +2513,182 @@ async def delete_channel(handle: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"@{handle} not found")
     return {"success": True, "handle": handle}
+
+# ── Telegram session renewal (admin-only) ──────────────────────────────────────
+# Renews TELEGRAM_SESSION_STRING via a two-step OTP flow over HTTP instead of
+# running scraper.py (which blocks on input() and can't work non-interactively
+# on Render) + manually editing the Render env var + redeploying. The renewed
+# string is saved to Mongo (see save_session_string) and picked up by the very
+# next fetch_telegram() call — no restart needed.
+
+_pending_renewals: dict[str, dict] = {}   # renewal_id -> {client, phone_code_hash, phone, created_at}
+_RENEWAL_TTL = timedelta(minutes=10)
+
+
+async def _drop_stale_renewals() -> None:
+    now = datetime.now(timezone.utc)
+    stale = [rid for rid, r in _pending_renewals.items() if now - r["created_at"] > _RENEWAL_TTL]
+    for rid in stale:
+        pending = _pending_renewals.pop(rid, None)
+        if pending:
+            await pending["client"].disconnect()
+
+
+class TelegramRenewStart(BaseModel):
+    phone: Optional[str] = None
+
+
+class TelegramRenewComplete(BaseModel):
+    renewal_id: str
+    code: str
+    password: Optional[str] = None
+
+
+@app.post("/admin/telegram/renew/start", dependencies=[Depends(require_admin)])
+async def telegram_renew_start(body: TelegramRenewStart):
+    await _drop_stale_renewals()
+    phone = body.phone or TELEGRAM_PHONE
+    if not phone:
+        raise HTTPException(status_code=400, detail="No phone number given and TELEGRAM_PHONE not set")
+
+    client = TelegramClient(StringSession(), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+    except Exception as e:
+        await client.disconnect()
+        raise HTTPException(status_code=400, detail=f"Failed to send code: {e}")
+
+    renewal_id = hashlib.sha256(f"{phone}{datetime.now(timezone.utc).isoformat()}".encode()).hexdigest()[:16]
+    _pending_renewals[renewal_id] = {
+        "client":          client,
+        "phone_code_hash": sent.phone_code_hash,
+        "phone":           phone,
+        "created_at":      datetime.now(timezone.utc),
+    }
+    return {"renewal_id": renewal_id, "message": "Code sent — call /complete within 10 minutes."}
+
+
+@app.post("/admin/telegram/renew/complete", dependencies=[Depends(require_admin)])
+async def telegram_renew_complete(body: TelegramRenewComplete):
+    await _drop_stale_renewals()
+    pending = _pending_renewals.get(body.renewal_id)
+    if not pending:
+        raise HTTPException(status_code=400, detail="Unknown or expired renewal_id — call /start again")
+
+    client = pending["client"]
+    try:
+        try:
+            await client.sign_in(
+                phone=pending["phone"],
+                code=body.code,
+                phone_code_hash=pending["phone_code_hash"],
+            )
+        except SessionPasswordNeededError:
+            if not body.password:
+                raise HTTPException(status_code=400, detail="2FA password required")
+            await client.sign_in(password=body.password)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Sign-in failed: {e}")
+
+    new_session_string = client.session.save()
+    await save_session_string(new_session_string)
+    await client.disconnect()
+    _pending_renewals.pop(body.renewal_id, None)
+    return {"status": "renewed"}
+
+
+_TELEGRAM_RENEW_PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Renew Telegram session</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 60px auto; }
+    label { display: block; margin-top: 12px; font-size: 14px; }
+    input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
+    #step2 { display: none; }
+    #msg { margin-top: 16px; font-size: 14px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>Renew Telegram session</h2>
+
+  <label>Admin token <input id="token" type="password"></label>
+
+  <div id="step1">
+    <label>Phone (e.g. +234...) <input id="phone" type="text"></label>
+    <button id="sendCodeBtn">Send Code</button>
+  </div>
+
+  <div id="step2">
+    <label>Code <input id="code" type="text"></label>
+    <label>2FA password (only if asked) <input id="password" type="password"></label>
+    <button id="completeBtn">Complete</button>
+  </div>
+
+  <div id="msg"></div>
+
+  <script>
+    let renewalId = null;
+
+    async function call(path, body) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-admin-token": document.getElementById("token").value,
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      return data;
+    }
+
+    document.getElementById("sendCodeBtn").onclick = async () => {
+      const msg = document.getElementById("msg");
+      msg.textContent = "Sending code...";
+      try {
+        const data = await call("/admin/telegram/renew/start", {
+          phone: document.getElementById("phone").value,
+        });
+        renewalId = data.renewal_id;
+        document.getElementById("step2").style.display = "block";
+        msg.textContent = "Code sent — check your phone.";
+      } catch (e) {
+        msg.textContent = "Error: " + e.message;
+      }
+    };
+
+    document.getElementById("completeBtn").onclick = async () => {
+      const msg = document.getElementById("msg");
+      msg.textContent = "Completing...";
+      try {
+        await call("/admin/telegram/renew/complete", {
+          renewal_id: renewalId,
+          code: document.getElementById("code").value,
+          password: document.getElementById("password").value || null,
+        });
+        msg.textContent = "✓ Session renewed. Telegram fetches will use it on the next run.";
+      } catch (e) {
+        msg.textContent = "Error: " + e.message + " — you can retry the code above.";
+      }
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/telegram/renew", response_class=HTMLResponse)
+async def telegram_renew_page():
+    return HTMLResponse(_TELEGRAM_RENEW_PAGE)
+
 
 @app.get("/monitor", response_model=MonitorResponse)
 async def get_monitor():
