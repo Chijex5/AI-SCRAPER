@@ -23,7 +23,17 @@ from google import genai
 from google.genai import types as genai_types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from telethon import TelegramClient
-from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
+from telethon.errors import (
+    ChannelInvalidError,
+    UsernameNotOccupiedError,
+    AuthKeyError,
+    AuthKeyUnregisteredError,
+    SessionExpiredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    SessionPasswordNeededError,
+)
 from telethon.sessions import StringSession
 from score import score_signal, SENIORITY_KEYWORDS, SENIOR_KEYWORDS
 
@@ -1050,6 +1060,22 @@ async def fetch_telegram() -> list[dict]:
     )
     try:
         await tg.start(phone=TELEGRAM_PHONE)
+    except (
+        AuthKeyError,
+        AuthKeyUnregisteredError,
+        SessionExpiredError,
+        SessionRevokedError,
+        UserDeactivatedError,
+        UserDeactivatedBanError,
+        SessionPasswordNeededError,
+    ) as auth_err:
+        msg = (
+            f"⚠ Telegram session is dead ({type(auth_err).__name__}: {auth_err}) — "
+            f"re-run scraper.py and update TELEGRAM_SESSION_STRING."
+        )
+        print(f"  ↳ {msg}")
+        await log_event(msg, "error")
+        return []
     except Exception as auth_err:
         print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew TELEGRAM_SESSION_STRING to fix.")
         return []
