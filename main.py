@@ -18,8 +18,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from google import genai
+from google.genai import types as genai_types
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from telethon import TelegramClient
 from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
 from telethon.sessions import StringSession
@@ -288,6 +290,8 @@ async def connect_db() -> None:
             max=100,          # max 100 documents
         )
     print("✅ pipeline_events collection ready")
+    health_col = db.client[DB_NAME]["source_health"]
+    await health_col.create_index([("source", 1), ("at", -1)])
     print(f"✅ MongoDB connected → {DB_NAME}.signals")
 
 
@@ -377,6 +381,51 @@ async def log_event(message: str, status: str = "info") -> None:
         })
     except Exception as e:
         print(f"  ⚠  log_event failed: {e}")
+
+
+def get_source_health_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["source_health"]
+
+
+_SOURCE_HEALTH_LOOKBACK = 7   # runs to average over when judging a drop
+
+
+async def record_source_health(source: str, count: int) -> None:
+    """
+    Record this run's listing count for `source` and flag an unexpected drop
+    against the rolling average of its last few runs (e.g. a site redesign
+    silently breaking a BeautifulSoup selector). Never raises.
+    """
+    try:
+        col = get_source_health_col()
+        recent = await col.find(
+            {"source": source}, {"count": 1, "_id": 0}
+        ).sort("at", -1).limit(_SOURCE_HEALTH_LOOKBACK).to_list(length=_SOURCE_HEALTH_LOOKBACK)
+
+        await col.insert_one({
+            "source": source,
+            "count":  count,
+            "at":     datetime.now(timezone.utc).isoformat(),
+        })
+
+        if recent:
+            avg = sum(d["count"] for d in recent) / len(recent)
+            if avg >= 3 and count == 0:
+                await log_event(
+                    f"⚠ Source health: {source} returned 0 listings "
+                    f"(recent avg {avg:.1f} over {len(recent)} runs) — possible breakage",
+                    "error",
+                )
+            elif avg >= 3 and count <= avg * 0.1:
+                await log_event(
+                    f"⚠ Source health: {source} returned {count} listings, "
+                    f"a sharp drop from recent avg {avg:.1f}",
+                    "error",
+                )
+    except Exception as e:
+        print(f"  ⚠  record_source_health failed: {e}")
 
 def _notif_id(prefix: str, *parts: str) -> str:
     """Stable, short, collision-resistant ID for a notification."""
@@ -694,17 +743,37 @@ BLUESKY_QUERIES = [
 ]
 
 
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """Retry on timeouts/connection errors and 5xx — not on 4xx (won't fix itself)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception(_is_retryable_http_error),
+    reraise=True,
+)
+async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """Shared GET with retry-with-backoff for transient failures."""
+    resp = await client.get(url, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
 async def fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
     listings: list[dict] = []
     seen: set[str] = set()
     for category in ["software-dev", "mobile"]:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://remotive.com/api/remote-jobs",
                 params={"category": category, "limit": 50},
                 timeout=15,
             )
-            resp.raise_for_status()
             for job in resp.json().get("jobs", []):
                 jid = str(job.get("id", ""))
                 if jid in seen:
@@ -756,7 +825,7 @@ async def fetch_jobberman(client: httpx.AsyncClient) -> list[dict]:
         slug = query.replace(" ", "+")
         url  = f"https://www.jobberman.com/jobs?q={slug}&l=Nigeria"
         try:
-            resp  = await client.get(url, headers=headers, timeout=20, follow_redirects=True)
+            resp  = await _get(client, url, headers=headers, timeout=20, follow_redirects=True)
             soup  = BeautifulSoup(resp.text, "html.parser")
             cards = (
                 soup.select("div[class*='listing-item']")
@@ -802,7 +871,7 @@ async def fetch_myjobmag(client: httpx.AsyncClient) -> list[dict]:
         slug = query.replace(" ", "+")
         url  = f"https://www.myjobmag.com/search-jobs?keywords={slug}&location=Nigeria"
         try:
-            resp  = await client.get(url, headers=headers, timeout=20, follow_redirects=True)
+            resp  = await _get(client, url, headers=headers, timeout=20, follow_redirects=True)
             soup  = BeautifulSoup(resp.text, "html.parser")
             cards = (
                 soup.select("div.job-list-item")
@@ -843,13 +912,13 @@ async def fetch_himalayas(client: httpx.AsyncClient) -> list[dict]:
         "mobile developer intern", "junior frontend", "junior backend",
     ]:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://himalayas.app/jobs/api",
                 params={"q": q, "limit": 20},
                 headers={"Accept": "application/json"},
                 timeout=15,
             )
-            resp.raise_for_status()
             for job in resp.json().get("jobs", []):
                 jid = str(job.get("id") or job.get("slug", ""))
                 if jid in seen:
@@ -880,12 +949,12 @@ async def fetch_remoteok(client: httpx.AsyncClient) -> list[dict]:
     listings: list[dict] = []
     seen: set[str] = set()
     try:
-        resp = await client.get(
+        resp = await _get(
+            client,
             "https://remoteok.com/api",
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             timeout=20,
         )
-        resp.raise_for_status()
         jobs = resp.json()
         for job in jobs[1:]:  # index 0 is a legal header object
             jid = str(job.get("id", ""))
@@ -923,13 +992,13 @@ async def fetch_bluesky(client: httpx.AsyncClient) -> list[dict]:
     seen: set[str] = set()
     for query in BLUESKY_QUERIES:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts",
                 params={"q": query, "limit": 100},
                 headers={"Accept": "application/json"},
                 timeout=15,
             )
-            resp.raise_for_status()
             for post in resp.json().get("posts", []):
                 uri  = post.get("uri", "")
                 text = (post.get("record") or {}).get("text", "")
@@ -1096,31 +1165,36 @@ pay: exact pay/stipend string from the listing, or null
 apply_link: direct application URL, or null
 
 ━━ OUTPUT ━━
-Return ONLY a JSON array, no markdown fences, no commentary.
-One object per listing, indexed from 0:
-
-{
-  "index":              <integer>,
-  "is_valid":           true | false,
-  "confidence":         "High" | "Medium" | "Low",
-  "source_confidence":  "High" | "Medium" | "Low",
-  "reason":             "one sentence if invalid, else empty string",
-  "company":            "company name or null",
-  "position":           "exact role title",
-  "pay":                "verbatim pay info or null",
-  "location":           "Nigeria Remote" | "Nigeria Onsite" | "Remote" | "Other" | "Unknown",
-  "role_mode":          "Remote" | "Hybrid" | "On-site",
-  "role_type":          "Software Engineering" | "Mobile" | "Data" | "DevOps" | "QA" | "Design" | "Other",
-  "application_status": "Open" | "Closing soon" | "Unknown",
-  "skill_tags":         ["Tag1", "Tag2", ...],
-  "skill_alignment":    "Skill1, Skill2, ...",
-  "relevance_reason":   "Why this matters to a Nigerian dev",
-  "notes":              "Short summary for feed card",
-  "apply_link":         "url or null"
-}
+One object per listing, indexed from 0. "reason" is a one-sentence note if
+is_valid is false, else an empty string.
 
 LISTINGS:
 """
+
+
+class GeminiListingResult(BaseModel):
+    """
+    Schema enforced on Gemini's output via response_schema — the model is
+    constrained to emit valid JSON matching this shape, which removes the
+    need to strip markdown fences / guess at malformed output.
+    """
+    index:              int
+    is_valid:           bool
+    confidence:         str            = "Medium"
+    source_confidence:  str            = "Medium"
+    reason:             str            = ""
+    company:            Optional[str]  = None
+    position:           Optional[str]  = None
+    pay:                Optional[str]  = None
+    location:           str            = "Unknown"
+    role_mode:          str            = "Remote"
+    role_type:           str           = "Software Engineering"
+    application_status: str            = "Unknown"
+    skill_tags:         list[str]      = []
+    skill_alignment:    str            = ""
+    relevance_reason:   str            = ""
+    notes:              str            = ""
+    apply_link:         Optional[str]  = None
 
 
 def _next_client() -> tuple[genai.Client, int]:
@@ -1132,7 +1206,15 @@ def _next_client() -> tuple[genai.Client, int]:
 
 
 def _parse_gemini_response(raw: str, batch: list[dict]) -> list[dict]:
-    """Strip markdown fences and parse Gemini JSON into enriched items."""
+    """
+    Parse Gemini's JSON output into enriched items.
+
+    With response_schema enforced on the API call, `raw` should already be a
+    clean JSON array — the markdown-fence stripping below is a defensive
+    fallback in case a caller passes fenced text directly (e.g. in tests).
+    Each item is validated against GeminiListingResult, so malformed shapes
+    raise pydantic.ValidationError instead of silently producing bad data.
+    """
     raw = raw.strip()
     if raw.startswith("```"):
         parts = raw.split("```")
@@ -1141,28 +1223,28 @@ def _parse_gemini_response(raw: str, batch: list[dict]) -> list[dict]:
             raw = raw[4:]
     raw = raw.strip()
 
-    parsed: list[dict] = json.loads(raw)   # raises JSONDecodeError on bad output
+    parsed_raw: list[dict] = json.loads(raw)   # raises JSONDecodeError on bad output
     results: list[dict] = []
-    for item in parsed:
-        idx_val = item.get("index")
-        if not item.get("is_valid") or idx_val is None or not (0 <= idx_val < len(batch)):
+    for raw_item in parsed_raw:
+        item = GeminiListingResult.model_validate(raw_item)   # raises ValidationError on bad shape
+        if not item.is_valid or not (0 <= item.index < len(batch)):
             continue
         enriched = {
-            **batch[idx_val],
-            "company":            item.get("company"),
-            "position":           item.get("position"),
-            "pay":                item.get("pay"),
-            "location":           item.get("location", "Unknown"),
-            "role_mode":          item.get("role_mode", "Remote"),
-            "role_type":          item.get("role_type", "Software Engineering"),
-            "application_status": item.get("application_status", "Unknown"),
-            "skill_tags":         item.get("skill_tags", []),
-            "skill_alignment":    item.get("skill_alignment", ""),
-            "relevance_reason":   item.get("relevance_reason", ""),
-            "notes":              item.get("notes", ""),
-            "apply_link":         item.get("apply_link"),
-            "confidence":         item.get("confidence", "Medium"),
-            "source_confidence":  item.get("source_confidence", "Medium"),
+            **batch[item.index],
+            "company":            item.company,
+            "position":           item.position,
+            "pay":                item.pay,
+            "location":           item.location,
+            "role_mode":          item.role_mode,
+            "role_type":          item.role_type,
+            "application_status": item.application_status,
+            "skill_tags":         item.skill_tags,
+            "skill_alignment":    item.skill_alignment,
+            "relevance_reason":   item.relevance_reason,
+            "notes":              item.notes,
+            "apply_link":         item.apply_link,
+            "confidence":         item.confidence,
+            "source_confidence":  item.source_confidence,
         }
         results.append(enriched)
     return results
@@ -1199,7 +1281,7 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
         """
         Attempt every key once. Returns parsed results on first success,
         or None if every key failed with a retriable error.
-        Raises JSONDecodeError immediately on bad JSON (not retriable).
+        Raises JSONDecodeError/ValidationError immediately on bad output (not retriable).
         """
         for _ in range(n_keys):
             client, idx = _next_client()
@@ -1208,14 +1290,18 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
                 response = client.models.generate_content(
                     model="gemini-3.1-flash-lite",
                     contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=list[GeminiListingResult],
+                    ),
                 )
                 results = _parse_gemini_response(response.text, batch)
                 print(f"    ✓ Batch validated ({key_label})")
                 return results
 
-            except json.JSONDecodeError as e:
-                # Malformed JSON — retrying won't help; bail immediately
-                print(f"  ⚠  Gemini JSON parse error ({key_label}): {e}")
+            except (json.JSONDecodeError, ValidationError) as e:
+                # Malformed output — retrying won't help; bail immediately
+                print(f"  ⚠  Gemini parse error ({key_label}): {e}")
                 raise   # propagate so the outer loop doesn't keep retrying
 
             except Exception as e:
@@ -1233,7 +1319,7 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
     while True:
         try:
             result = _try_all_keys()
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValidationError):
             return []   # unrecoverable — skip this batch silently
 
         if result is not None:
@@ -1358,14 +1444,22 @@ async def run_scrape_pipeline() -> dict[str, int]:
             ("RemoteOK",  fetch_remoteok),
             ("Bluesky",   fetch_bluesky),
         ]
-        web_results: list[list[dict]] = []
+        scrape_state["current_source"] = f"Fetching {len(web_sources)} sources in parallel…"
+        web_results_map: dict[str, list[dict]] = {}
         async with httpx.AsyncClient() as client:
-            for idx, (src_name, fn) in enumerate(web_sources):
-                scrape_state["current_source"] = src_name
-                scrape_state["progress"]       = 5 + int((idx / len(web_sources)) * 35)
-                web_results.append(await fn(client))
-                await log_event(f"Fetched {len(web_results[-1])} listings from {src_name}", "info")
-            
+            async def _fetch_named(name: str, fn) -> tuple[str, list[dict]]:
+                return name, await fn(client)
+
+            tasks = [asyncio.create_task(_fetch_named(name, fn)) for name, fn in web_sources]
+            for completed_n, coro in enumerate(asyncio.as_completed(tasks), start=1):
+                name, result = await coro
+                web_results_map[name] = result
+                await record_source_health(name, len(result))
+                await log_event(f"Fetched {len(result)} listings from {name}", "info")
+                scrape_state["current_source"] = f"{name} done"
+                scrape_state["progress"]       = 5 + int((completed_n / len(web_sources)) * 35)
+
+        web_results: list[list[dict]] = [web_results_map[name] for name, _ in web_sources]
         scrape_state["progress"]      = 40
         scrape_state["current_source"] = "Telegram channels"
         tg = await fetch_telegram()  # updates progress 40→70 internally
