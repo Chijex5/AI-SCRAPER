@@ -5,7 +5,10 @@
 *.env
 *.env.*
 venv/
-/venv   
+/venv
 __pycache__/
 *.pyc
 *.pyo
+cookies.json
+*.session
+*.session-journal

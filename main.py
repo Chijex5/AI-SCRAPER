@@ -2,26 +2,37 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pymongo import ReturnDocument
 from typing import Any, Optional
-from datetime import datetime, timedelta, timezone   # ← add timedelta
-import hashlib                      
-from health import router as health_router           
+import hashlib
+from health import router as health_router
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from bson import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from google import genai
+from google.genai import types as genai_types
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from telethon import TelegramClient
-from telethon.errors import ChannelInvalidError, UsernameNotOccupiedError
+from telethon.errors import (
+    ChannelInvalidError,
+    UsernameNotOccupiedError,
+    AuthKeyError,
+    AuthKeyUnregisteredError,
+    SessionExpiredError,
+    SessionRevokedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+    SessionPasswordNeededError,
+)
 from telethon.sessions import StringSession
 from score import score_signal, SENIORITY_KEYWORDS, SENIOR_KEYWORDS
 
@@ -41,6 +52,15 @@ TELEGRAM_API_ID   = int(os.getenv("TELEGRAM_API_ID",   "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH",     "")
 TELEGRAM_PHONE    = os.getenv("TELEGRAM_PHONE",        "")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+async def require_admin(x_admin_token: str = Header(default="")) -> None:
+    """Guards the Telegram session-renewal endpoints — the only auth in this app."""
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        print(f"✗ Admin auth failed: x_admin_token={x_admin_token}, ADMIN_TOKEN={ADMIN_TOKEN}")
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 BATCH_SIZE = 8   # smaller — richer prompt = more tokens per item
@@ -288,6 +308,8 @@ async def connect_db() -> None:
             max=100,          # max 100 documents
         )
     print("✅ pipeline_events collection ready")
+    health_col = db.client[DB_NAME]["source_health"]
+    await health_col.create_index([("source", 1), ("at", -1)])
     print(f"✅ MongoDB connected → {DB_NAME}.signals")
 
 
@@ -299,8 +321,31 @@ def get_channels_col():
     if db.client is None:
         raise RuntimeError("Database not initialised")
     return db.client[DB_NAME]["telegram_channels"]
- 
- 
+
+
+def get_config_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["app_config"]
+
+
+async def get_session_string() -> str:
+    """Mongo holds the live, renewable session string; the env var is only
+    the bootstrap fallback for a brand-new deployment with nothing saved yet."""
+    col = get_config_col()
+    doc = await col.find_one({"_id": "telegram_session"})
+    return doc["value"] if doc else SESSION_STRING
+
+
+async def save_session_string(value: str) -> None:
+    col = get_config_col()
+    await col.update_one(
+        {"_id": "telegram_session"},
+        {"$set": {"value": value, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+
+
 async def seed_channels_if_empty():
     """On first boot, populate the channels collection from the hardcoded seed list."""
     col = get_channels_col()
@@ -377,6 +422,51 @@ async def log_event(message: str, status: str = "info") -> None:
         })
     except Exception as e:
         print(f"  ⚠  log_event failed: {e}")
+
+
+def get_source_health_col():
+    if db.client is None:
+        raise RuntimeError("Database not initialised")
+    return db.client[DB_NAME]["source_health"]
+
+
+_SOURCE_HEALTH_LOOKBACK = 7   # runs to average over when judging a drop
+
+
+async def record_source_health(source: str, count: int) -> None:
+    """
+    Record this run's listing count for `source` and flag an unexpected drop
+    against the rolling average of its last few runs (e.g. a site redesign
+    silently breaking a BeautifulSoup selector). Never raises.
+    """
+    try:
+        col = get_source_health_col()
+        recent = await col.find(
+            {"source": source}, {"count": 1, "_id": 0}
+        ).sort("at", -1).limit(_SOURCE_HEALTH_LOOKBACK).to_list(length=_SOURCE_HEALTH_LOOKBACK)
+
+        await col.insert_one({
+            "source": source,
+            "count":  count,
+            "at":     datetime.now(timezone.utc).isoformat(),
+        })
+
+        if recent:
+            avg = sum(d["count"] for d in recent) / len(recent)
+            if avg >= 3 and count == 0:
+                await log_event(
+                    f"⚠ Source health: {source} returned 0 listings "
+                    f"(recent avg {avg:.1f} over {len(recent)} runs) — possible breakage",
+                    "error",
+                )
+            elif avg >= 3 and count <= avg * 0.1:
+                await log_event(
+                    f"⚠ Source health: {source} returned {count} listings, "
+                    f"a sharp drop from recent avg {avg:.1f}",
+                    "error",
+                )
+    except Exception as e:
+        print(f"  ⚠  record_source_health failed: {e}")
 
 def _notif_id(prefix: str, *parts: str) -> str:
     """Stable, short, collision-resistant ID for a notification."""
@@ -483,7 +573,9 @@ async def _generate_ai_insight(signals: list[dict], now: datetime) -> dict:
  
     try:
         client, _ = _next_client()
-        resp  = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        resp  = await asyncio.to_thread(
+            client.models.generate_content, model="gemini-2.5-flash", contents=prompt
+        )
         raw   = resp.text.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -694,17 +786,37 @@ BLUESKY_QUERIES = [
 ]
 
 
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    """Retry on timeouts/connection errors and 5xx — not on 4xx (won't fix itself)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception(_is_retryable_http_error),
+    reraise=True,
+)
+async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """Shared GET with retry-with-backoff for transient failures."""
+    resp = await client.get(url, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
 async def fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
     listings: list[dict] = []
     seen: set[str] = set()
     for category in ["software-dev", "mobile"]:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://remotive.com/api/remote-jobs",
                 params={"category": category, "limit": 50},
                 timeout=15,
             )
-            resp.raise_for_status()
             for job in resp.json().get("jobs", []):
                 jid = str(job.get("id", ""))
                 if jid in seen:
@@ -756,7 +868,7 @@ async def fetch_jobberman(client: httpx.AsyncClient) -> list[dict]:
         slug = query.replace(" ", "+")
         url  = f"https://www.jobberman.com/jobs?q={slug}&l=Nigeria"
         try:
-            resp  = await client.get(url, headers=headers, timeout=20, follow_redirects=True)
+            resp  = await _get(client, url, headers=headers, timeout=20, follow_redirects=True)
             soup  = BeautifulSoup(resp.text, "html.parser")
             cards = (
                 soup.select("div[class*='listing-item']")
@@ -802,7 +914,7 @@ async def fetch_myjobmag(client: httpx.AsyncClient) -> list[dict]:
         slug = query.replace(" ", "+")
         url  = f"https://www.myjobmag.com/search-jobs?keywords={slug}&location=Nigeria"
         try:
-            resp  = await client.get(url, headers=headers, timeout=20, follow_redirects=True)
+            resp  = await _get(client, url, headers=headers, timeout=20, follow_redirects=True)
             soup  = BeautifulSoup(resp.text, "html.parser")
             cards = (
                 soup.select("div.job-list-item")
@@ -843,13 +955,13 @@ async def fetch_himalayas(client: httpx.AsyncClient) -> list[dict]:
         "mobile developer intern", "junior frontend", "junior backend",
     ]:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://himalayas.app/jobs/api",
                 params={"q": q, "limit": 20},
                 headers={"Accept": "application/json"},
                 timeout=15,
             )
-            resp.raise_for_status()
             for job in resp.json().get("jobs", []):
                 jid = str(job.get("id") or job.get("slug", ""))
                 if jid in seen:
@@ -880,12 +992,12 @@ async def fetch_remoteok(client: httpx.AsyncClient) -> list[dict]:
     listings: list[dict] = []
     seen: set[str] = set()
     try:
-        resp = await client.get(
+        resp = await _get(
+            client,
             "https://remoteok.com/api",
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             timeout=20,
         )
-        resp.raise_for_status()
         jobs = resp.json()
         for job in jobs[1:]:  # index 0 is a legal header object
             jid = str(job.get("id", ""))
@@ -923,13 +1035,13 @@ async def fetch_bluesky(client: httpx.AsyncClient) -> list[dict]:
     seen: set[str] = set()
     for query in BLUESKY_QUERIES:
         try:
-            resp = await client.get(
+            resp = await _get(
+                client,
                 "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts",
                 params={"q": query, "limit": 100},
                 headers={"Accept": "application/json"},
                 timeout=15,
             )
-            resp.raise_for_status()
             for post in resp.json().get("posts", []):
                 uri  = post.get("uri", "")
                 text = (post.get("record") or {}).get("text", "")
@@ -962,8 +1074,9 @@ async def fetch_telegram() -> list[dict]:
         print("  ↳ Telegram: skipped (credentials not set)")
         return []
 
-    if not SESSION_STRING:
-        print("  ↳ Telegram: skipped (SESSION_STRING not set — run scraper.py to generate one)")
+    session_string = await get_session_string()
+    if not session_string:
+        print("  ↳ Telegram: skipped (no session string saved — use /admin/telegram/renew)")
         return []
 
     channels = await get_active_channels()
@@ -975,14 +1088,30 @@ async def fetch_telegram() -> list[dict]:
     seen:     set[str]   = set()
 
     tg = TelegramClient(
-        StringSession(SESSION_STRING),
+        StringSession(session_string),
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH,
     )
     try:
         await tg.start(phone=TELEGRAM_PHONE)
+    except (
+        AuthKeyError,
+        AuthKeyUnregisteredError,
+        SessionExpiredError,
+        SessionRevokedError,
+        UserDeactivatedError,
+        UserDeactivatedBanError,
+        SessionPasswordNeededError,
+    ) as auth_err:
+        msg = (
+            f"⚠ Telegram session is dead ({type(auth_err).__name__}: {auth_err}) — "
+            f"renew it at /admin/telegram/renew."
+        )
+        print(f"  ↳ {msg}")
+        await log_event(msg, "error")
+        return []
     except Exception as auth_err:
-        print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew TELEGRAM_SESSION_STRING to fix.")
+        print(f"  ↳ Telegram: auth failed ({auth_err}) — skipping. Renew it at /admin/telegram/renew.")
         return []
 
     try:
@@ -1096,31 +1225,36 @@ pay: exact pay/stipend string from the listing, or null
 apply_link: direct application URL, or null
 
 ━━ OUTPUT ━━
-Return ONLY a JSON array, no markdown fences, no commentary.
-One object per listing, indexed from 0:
-
-{
-  "index":              <integer>,
-  "is_valid":           true | false,
-  "confidence":         "High" | "Medium" | "Low",
-  "source_confidence":  "High" | "Medium" | "Low",
-  "reason":             "one sentence if invalid, else empty string",
-  "company":            "company name or null",
-  "position":           "exact role title",
-  "pay":                "verbatim pay info or null",
-  "location":           "Nigeria Remote" | "Nigeria Onsite" | "Remote" | "Other" | "Unknown",
-  "role_mode":          "Remote" | "Hybrid" | "On-site",
-  "role_type":          "Software Engineering" | "Mobile" | "Data" | "DevOps" | "QA" | "Design" | "Other",
-  "application_status": "Open" | "Closing soon" | "Unknown",
-  "skill_tags":         ["Tag1", "Tag2", ...],
-  "skill_alignment":    "Skill1, Skill2, ...",
-  "relevance_reason":   "Why this matters to a Nigerian dev",
-  "notes":              "Short summary for feed card",
-  "apply_link":         "url or null"
-}
+One object per listing, indexed from 0. "reason" is a one-sentence note if
+is_valid is false, else an empty string.
 
 LISTINGS:
 """
+
+
+class GeminiListingResult(BaseModel):
+    """
+    Schema enforced on Gemini's output via response_schema — the model is
+    constrained to emit valid JSON matching this shape, which removes the
+    need to strip markdown fences / guess at malformed output.
+    """
+    index:              int
+    is_valid:           bool
+    confidence:         str            = "Medium"
+    source_confidence:  str            = "Medium"
+    reason:             str            = ""
+    company:            Optional[str]  = None
+    position:           Optional[str]  = None
+    pay:                Optional[str]  = None
+    location:           str            = "Unknown"
+    role_mode:          str            = "Remote"
+    role_type:           str           = "Software Engineering"
+    application_status: str            = "Unknown"
+    skill_tags:         list[str]      = []
+    skill_alignment:    str            = ""
+    relevance_reason:   str            = ""
+    notes:              str            = ""
+    apply_link:         Optional[str]  = None
 
 
 def _next_client() -> tuple[genai.Client, int]:
@@ -1132,7 +1266,15 @@ def _next_client() -> tuple[genai.Client, int]:
 
 
 def _parse_gemini_response(raw: str, batch: list[dict]) -> list[dict]:
-    """Strip markdown fences and parse Gemini JSON into enriched items."""
+    """
+    Parse Gemini's JSON output into enriched items.
+
+    With response_schema enforced on the API call, `raw` should already be a
+    clean JSON array — the markdown-fence stripping below is a defensive
+    fallback in case a caller passes fenced text directly (e.g. in tests).
+    Each item is validated against GeminiListingResult, so malformed shapes
+    raise pydantic.ValidationError instead of silently producing bad data.
+    """
     raw = raw.strip()
     if raw.startswith("```"):
         parts = raw.split("```")
@@ -1141,28 +1283,28 @@ def _parse_gemini_response(raw: str, batch: list[dict]) -> list[dict]:
             raw = raw[4:]
     raw = raw.strip()
 
-    parsed: list[dict] = json.loads(raw)   # raises JSONDecodeError on bad output
+    parsed_raw: list[dict] = json.loads(raw)   # raises JSONDecodeError on bad output
     results: list[dict] = []
-    for item in parsed:
-        idx_val = item.get("index")
-        if not item.get("is_valid") or idx_val is None or not (0 <= idx_val < len(batch)):
+    for raw_item in parsed_raw:
+        item = GeminiListingResult.model_validate(raw_item)   # raises ValidationError on bad shape
+        if not item.is_valid or not (0 <= item.index < len(batch)):
             continue
         enriched = {
-            **batch[idx_val],
-            "company":            item.get("company"),
-            "position":           item.get("position"),
-            "pay":                item.get("pay"),
-            "location":           item.get("location", "Unknown"),
-            "role_mode":          item.get("role_mode", "Remote"),
-            "role_type":          item.get("role_type", "Software Engineering"),
-            "application_status": item.get("application_status", "Unknown"),
-            "skill_tags":         item.get("skill_tags", []),
-            "skill_alignment":    item.get("skill_alignment", ""),
-            "relevance_reason":   item.get("relevance_reason", ""),
-            "notes":              item.get("notes", ""),
-            "apply_link":         item.get("apply_link"),
-            "confidence":         item.get("confidence", "Medium"),
-            "source_confidence":  item.get("source_confidence", "Medium"),
+            **batch[item.index],
+            "company":            item.company,
+            "position":           item.position,
+            "pay":                item.pay,
+            "location":           item.location,
+            "role_mode":          item.role_mode,
+            "role_type":          item.role_type,
+            "application_status": item.application_status,
+            "skill_tags":         item.skill_tags,
+            "skill_alignment":    item.skill_alignment,
+            "relevance_reason":   item.relevance_reason,
+            "notes":              item.notes,
+            "apply_link":         item.apply_link,
+            "confidence":         item.confidence,
+            "source_confidence":  item.source_confidence,
         }
         results.append(enriched)
     return results
@@ -1195,27 +1337,36 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
     prompt   = GEMINI_PROMPT + numbered
     n_keys   = len(_gemini_clients)
 
-    def _try_all_keys() -> list[dict] | None:
+    async def _try_all_keys() -> list[dict] | None:
         """
         Attempt every key once. Returns parsed results on first success,
         or None if every key failed with a retriable error.
-        Raises JSONDecodeError immediately on bad JSON (not retriable).
+        Raises JSONDecodeError/ValidationError immediately on bad output (not retriable).
         """
         for _ in range(n_keys):
             client, idx = _next_client()
             key_label   = f"key {idx + 1}/{n_keys}"
             try:
-                response = client.models.generate_content(
+                # google-genai's generate_content is a blocking call — running it
+                # directly here would freeze the whole event loop (and with it,
+                # health checks + the scheduler) for the duration of every Gemini
+                # request. asyncio.to_thread keeps the loop free while it runs.
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
                     model="gemini-3.1-flash-lite",
                     contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=list[GeminiListingResult],
+                    ),
                 )
                 results = _parse_gemini_response(response.text, batch)
                 print(f"    ✓ Batch validated ({key_label})")
                 return results
 
-            except json.JSONDecodeError as e:
-                # Malformed JSON — retrying won't help; bail immediately
-                print(f"  ⚠  Gemini JSON parse error ({key_label}): {e}")
+            except (json.JSONDecodeError, ValidationError) as e:
+                # Malformed output — retrying won't help; bail immediately
+                print(f"  ⚠  Gemini parse error ({key_label}): {e}")
                 raise   # propagate so the outer loop doesn't keep retrying
 
             except Exception as e:
@@ -1232,8 +1383,8 @@ async def validate_batch(batch: list[dict]) -> list[dict]:
 
     while True:
         try:
-            result = _try_all_keys()
-        except json.JSONDecodeError:
+            result = await _try_all_keys()
+        except (json.JSONDecodeError, ValidationError):
             return []   # unrecoverable — skip this batch silently
 
         if result is not None:
@@ -1358,14 +1509,22 @@ async def run_scrape_pipeline() -> dict[str, int]:
             ("RemoteOK",  fetch_remoteok),
             ("Bluesky",   fetch_bluesky),
         ]
-        web_results: list[list[dict]] = []
+        scrape_state["current_source"] = f"Fetching {len(web_sources)} sources in parallel…"
+        web_results_map: dict[str, list[dict]] = {}
         async with httpx.AsyncClient() as client:
-            for idx, (src_name, fn) in enumerate(web_sources):
-                scrape_state["current_source"] = src_name
-                scrape_state["progress"]       = 5 + int((idx / len(web_sources)) * 35)
-                web_results.append(await fn(client))
-                await log_event(f"Fetched {len(web_results[-1])} listings from {src_name}", "info")
-            
+            async def _fetch_named(name: str, fn) -> tuple[str, list[dict]]:
+                return name, await fn(client)
+
+            tasks = [asyncio.create_task(_fetch_named(name, fn)) for name, fn in web_sources]
+            for completed_n, coro in enumerate(asyncio.as_completed(tasks), start=1):
+                name, result = await coro
+                web_results_map[name] = result
+                await record_source_health(name, len(result))
+                await log_event(f"Fetched {len(result)} listings from {name}", "info")
+                scrape_state["current_source"] = f"{name} done"
+                scrape_state["progress"]       = 5 + int((completed_n / len(web_sources)) * 35)
+
+        web_results: list[list[dict]] = [web_results_map[name] for name, _ in web_sources]
         scrape_state["progress"]      = 40
         scrape_state["current_source"] = "Telegram channels"
         tg = await fetch_telegram()  # updates progress 40→70 internally
@@ -2362,6 +2521,300 @@ async def delete_channel(handle: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"@{handle} not found")
     return {"success": True, "handle": handle}
+
+# ── Telegram session renewal (admin-only) ──────────────────────────────────────
+# Renews TELEGRAM_SESSION_STRING via a two-step OTP flow over HTTP instead of
+# running scraper.py (which blocks on input() and can't work non-interactively
+# on Render) + manually editing the Render env var + redeploying. The renewed
+# string is saved to Mongo (see save_session_string) and picked up by the very
+# next fetch_telegram() call — no restart needed.
+
+_pending_renewals: dict[str, dict] = {}   # renewal_id -> {client, phone_code_hash, phone, created_at}
+_RENEWAL_TTL = timedelta(minutes=10)
+
+
+async def _drop_stale_renewals() -> None:
+    now = datetime.now(timezone.utc)
+    stale = [rid for rid, r in _pending_renewals.items() if now - r["created_at"] > _RENEWAL_TTL]
+    for rid in stale:
+        pending = _pending_renewals.pop(rid, None)
+        if pending:
+            await pending["client"].disconnect()
+
+
+class TelegramRenewStart(BaseModel):
+    phone: Optional[str] = None
+
+
+class TelegramRenewComplete(BaseModel):
+    renewal_id: str
+    code: str
+    password: Optional[str] = None
+
+
+@app.post("/admin/telegram/renew/start", dependencies=[Depends(require_admin)])
+async def telegram_renew_start(body: TelegramRenewStart):
+    await _drop_stale_renewals()
+    phone = body.phone or TELEGRAM_PHONE
+    if not phone:
+        raise HTTPException(status_code=400, detail="No phone number given and TELEGRAM_PHONE not set")
+
+    client = TelegramClient(StringSession(), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    await client.connect()
+    try:
+        sent = await client.send_code_request(phone)
+    except Exception as e:
+        await client.disconnect()
+        raise HTTPException(status_code=400, detail=f"Failed to send code: {e}")
+
+    renewal_id = hashlib.sha256(f"{phone}{datetime.now(timezone.utc).isoformat()}".encode()).hexdigest()[:16]
+    _pending_renewals[renewal_id] = {
+        "client":          client,
+        "phone_code_hash": sent.phone_code_hash,
+        "phone":           phone,
+        "created_at":      datetime.now(timezone.utc),
+    }
+    return {"renewal_id": renewal_id, "message": "Code sent — call /complete within 10 minutes."}
+
+
+@app.post("/admin/telegram/renew/complete", dependencies=[Depends(require_admin)])
+async def telegram_renew_complete(body: TelegramRenewComplete):
+    await _drop_stale_renewals()
+    pending = _pending_renewals.get(body.renewal_id)
+    if not pending:
+        raise HTTPException(status_code=400, detail="Unknown or expired renewal_id — call /start again")
+
+    client = pending["client"]
+    try:
+        try:
+            await client.sign_in(
+                phone=pending["phone"],
+                code=body.code,
+                phone_code_hash=pending["phone_code_hash"],
+            )
+        except SessionPasswordNeededError:
+            if not body.password:
+                raise HTTPException(status_code=400, detail="2FA password required")
+            await client.sign_in(password=body.password)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Sign-in failed: {e}")
+
+    new_session_string = client.session.save()
+    await save_session_string(new_session_string)
+    await client.disconnect()
+    _pending_renewals.pop(body.renewal_id, None)
+    return {"status": "renewed"}
+
+
+_TELEGRAM_RENEW_PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Renew Telegram session</title>
+  <style>
+    :root {
+      --tg-blue: #2AABEE;
+      --tg-blue-dark: #229ED9;
+      --bg: #0f1720;
+      --card: #1a2530;
+      --text: #e8edf2;
+      --muted: #8b9cad;
+      --border: #2a3a48;
+      --ok: #3ddc84;
+      --err: #ff6868;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #16222c, var(--bg) 65%);
+      color: var(--text);
+      min-height: 100vh;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 28px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+    .header svg { flex: none; }
+    h1 { font-size: 18px; font-weight: 600; margin: 0; }
+    .subtitle { color: var(--muted); font-size: 13px; margin: 6px 0 24px; line-height: 1.5; }
+    .steps { display: flex; gap: 8px; margin-bottom: 24px; }
+    .steps .dot {
+      flex: 1; height: 4px; border-radius: 2px; background: var(--border);
+      transition: background 0.25s;
+    }
+    .steps .dot.active { background: var(--tg-blue); }
+    label {
+      display: block; font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+      color: var(--muted); text-transform: uppercase; margin-top: 18px; margin-bottom: 6px;
+    }
+    label:first-of-type { margin-top: 0; }
+    input {
+      width: 100%; padding: 11px 12px; font-size: 14px; color: var(--text);
+      background: #0f1720; border: 1px solid var(--border); border-radius: 8px;
+      outline: none; transition: border-color 0.15s;
+    }
+    input::placeholder { color: #5a6b7a; }
+    input:focus { border-color: var(--tg-blue); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    button {
+      width: 100%; margin-top: 22px; padding: 12px 16px; font-size: 14px; font-weight: 600;
+      color: #fff; background: linear-gradient(135deg, var(--tg-blue), var(--tg-blue-dark));
+      border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.15s, transform 0.05s;
+    }
+    button:hover { opacity: 0.92; }
+    button:active { transform: scale(0.99); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary {
+      background: transparent; border: 1px solid var(--border); color: var(--muted); margin-top: 10px;
+    }
+    button.secondary:hover { color: var(--text); border-color: var(--muted); }
+    #step2 { display: none; }
+    #msg {
+      margin-top: 18px; font-size: 13px; line-height: 1.5; white-space: pre-wrap;
+      border-radius: 8px; padding: 0; transition: padding 0.15s;
+    }
+    #msg:not(:empty) { padding: 10px 12px; background: #0f1720; border: 1px solid var(--border); }
+    #msg.ok { color: var(--ok); border-color: var(--ok); }
+    #msg.err { color: var(--err); border-color: var(--err); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <svg width="28" height="28" viewBox="0 0 240 240" fill="none">
+        <circle cx="120" cy="120" r="120" fill="#2AABEE"/>
+        <path d="M170 72l-22 110c-1.6 7.5-6 9.3-12.2 5.8l-33.8-25-16.3 15.7c-1.8 1.8-3.3 3.3-6.8 3.3l2.4-34.7L156 86.4c3.3-2.9-.7-4.6-4.2-1.6l-67.5 42.5-29-9.1c-6.3-2-6.4-6.3 1.4-9.3l113.4-43.7c5.2-2 9.8 1.2 8 9.8z" fill="#fff"/>
+      </svg>
+      <h1>Renew Telegram session</h1>
+    </div>
+    <p class="subtitle">Re-authenticate the scraper's Telegram account. The code is sent straight to your phone — enter it below to finish.</p>
+
+    <div class="steps">
+      <div class="dot active" id="dot1"></div>
+      <div class="dot" id="dot2"></div>
+    </div>
+
+    <label>Admin token</label>
+    <input id="token" type="password" placeholder="••••••••••••">
+
+    <div id="step1">
+      <label>Phone number</label>
+      <input id="phone" type="text" placeholder="+234...">
+      <button id="sendCodeBtn">Send Code</button>
+    </div>
+
+    <div id="step2">
+      <label>Verification code</label>
+      <input id="code" type="text" placeholder="12345" inputmode="numeric">
+      <label>2FA password <span class="hint" style="display:inline;text-transform:none;font-weight:400;">(only if Telegram asks)</span></label>
+      <input id="password" type="password" placeholder="Optional">
+      <button id="completeBtn">Complete</button>
+      <button id="restartBtn" class="secondary" type="button">Start over</button>
+    </div>
+
+    <div id="msg"></div>
+  </div>
+
+  <script>
+    let renewalId = null;
+    const msgEl = document.getElementById("msg");
+
+    function setMsg(text, kind) {
+      msgEl.textContent = text;
+      msgEl.className = kind || "";
+    }
+
+    function setBusy(btn, busy, label) {
+      btn.disabled = busy;
+      btn.textContent = busy ? label : btn.dataset.label;
+    }
+
+    async function call(path, body) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-admin-token": document.getElementById("token").value,
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      return data;
+    }
+
+    const sendCodeBtn = document.getElementById("sendCodeBtn");
+    sendCodeBtn.dataset.label = sendCodeBtn.textContent;
+    sendCodeBtn.onclick = async () => {
+      setBusy(sendCodeBtn, true, "Sending…");
+      setMsg("");
+      try {
+        const data = await call("/admin/telegram/renew/start", {
+          phone: document.getElementById("phone").value,
+        });
+        renewalId = data.renewal_id;
+        document.getElementById("step2").style.display = "block";
+        document.getElementById("dot2").classList.add("active");
+        setMsg("Code sent — check your phone.", "ok");
+      } catch (e) {
+        setMsg("Error: " + e.message, "err");
+      } finally {
+        setBusy(sendCodeBtn, false);
+      }
+    };
+
+    const completeBtn = document.getElementById("completeBtn");
+    completeBtn.dataset.label = completeBtn.textContent;
+    completeBtn.onclick = async () => {
+      setBusy(completeBtn, true, "Verifying…");
+      try {
+        await call("/admin/telegram/renew/complete", {
+          renewal_id: renewalId,
+          code: document.getElementById("code").value,
+          password: document.getElementById("password").value || null,
+        });
+        setMsg("✓ Session renewed. Telegram fetches will use it on the next run.", "ok");
+      } catch (e) {
+        setMsg("Error: " + e.message + " — you can retry the code above.", "err");
+      } finally {
+        setBusy(completeBtn, false);
+      }
+    };
+
+    document.getElementById("restartBtn").onclick = () => {
+      renewalId = null;
+      document.getElementById("step2").style.display = "none";
+      document.getElementById("dot2").classList.remove("active");
+      document.getElementById("code").value = "";
+      document.getElementById("password").value = "";
+      document.getElementById("phone").value = "";
+      setMsg("");
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin/telegram/renew", response_class=HTMLResponse)
+async def telegram_renew_page():
+    return HTMLResponse(_TELEGRAM_RENEW_PAGE)
+
 
 @app.get("/monitor", response_model=MonitorResponse)
 async def get_monitor():
