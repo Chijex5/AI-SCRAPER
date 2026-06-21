@@ -46,6 +46,7 @@ pyjsparser==2.7.1
 pymongo==4.17.0
 pyotp==2.9.0
 pyparsing==3.3.2
+pytest==9.1.1
 python-dotenv==1.2.2
 PyYAML==6.0.3
 requests==2.34.2
