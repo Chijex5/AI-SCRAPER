@@ -1,0 +1,52 @@
+name: Scheduled pipelines
+
+# Render's free Web Service plan sleeps after ~15 min of no inbound HTTP
+# traffic, which silently kills the in-process APScheduler jobs in main.py
+# (lifespan()) whenever the dyno happens to be asleep at the scheduled time.
+# These external triggers call the same HTTP endpoints the app already
+# exposes — the inbound request itself wakes a sleeping instance, so the
+# pipeline actually runs regardless of whether Render kept it warm.
+#
+# main.py's in-process scheduler is left in place as a harmless backup for
+# whenever the dyno is already awake at the right moment; both paths are
+# guarded against overlapping runs (see scrape_state/notifications_state).
+#
+# Schedule times are UTC (GitHub Actions cron does not support time zones).
+# Africa/Lagos is UTC+1 year-round (no DST) — keep these in sync with
+# SCRAPE_HOUR/SCRAPE_MINUTE and the weekly_notifications/weekly_cleanup cron
+# times in main.py if either ever changes.
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 00:00 Africa/Lagos daily   -> daily scrape
+    - cron: "0 5 * * 0"    # 06:00 Africa/Lagos Sunday   -> weekly notifications
+    - cron: "0 2 * * 1"    # 03:00 Africa/Lagos Monday   -> weekly cleanup
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Pipeline to trigger manually"
+        required: true
+        default: scrape
+        type: choice
+        options: [scrape, notifications, cleanup]
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Daily scrape
+        if: github.event.schedule == '0 23 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'scrape')
+        run: |
+          curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 1500 \
+            -X POST "${{ vars.RENDER_APP_URL }}/scrape/run"
+
+      - name: Weekly notifications
+        if: github.event.schedule == '0 5 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.job == 'notifications')
+        run: |
+          curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 300 \
+            -X POST "${{ vars.RENDER_APP_URL }}/notifications/generate"
+
+      - name: Weekly cleanup
+        if: github.event.schedule == '0 2 * * 1' || (github.event_name == 'workflow_dispatch' && inputs.job == 'cleanup')
+        run: |
+          curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 300 \
+            -X DELETE "${{ vars.RENDER_APP_URL }}/signals/cleanup?days=30"
