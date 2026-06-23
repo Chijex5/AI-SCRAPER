@@ -59,7 +59,6 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 async def require_admin(x_admin_token: str = Header(default="")) -> None:
     """Guards the Telegram session-renewal endpoints — the only auth in this app."""
     if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
-        print(f"✗ Admin auth failed: x_admin_token={x_admin_token}, ADMIN_TOKEN={ADMIN_TOKEN}")
         raise HTTPException(status_code=403, detail="forbidden")
 
 
