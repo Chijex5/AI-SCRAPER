@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 import asyncio, time
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, status, Response
 from pydantic import BaseModel
 
 
@@ -158,6 +158,12 @@ def _scheduler_jobs() -> dict[str, SchedulerJob]:
     response_model=HealthResponse,
     summary="Full readiness check",
 )
+
+@router.head("/health", include_in_schema=False)
+async def health_head():
+    await health_check()
+    return Response(status_code=200)
+    
 async def health_check() -> HealthResponse:
     """Probe MongoDB + Gemini pool in parallel; aggregate overall status."""
     from main import DB_NAME, _gemini_clients
