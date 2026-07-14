@@ -1988,9 +1988,6 @@ async def generate_notifications_pipeline() -> int:
         if notifications:
             await notif_col.insert_many(notifications)
 
-        if notifications:
-            await notif_col.insert_many(notifications)
- 
         notifications_state["last_run"]   = gen_time
         notifications_state["last_count"] = len(notifications)
  
