@@ -37,16 +37,16 @@ jobs:
         if: github.event.schedule == '0 23 * * *' || (github.event_name == 'workflow_dispatch' && inputs.job == 'scrape')
         run: |
           curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 1500 \
-            -X POST "${{ vars.RENDER_APP_URL }}/scrape/run"
+            -X POST "${{ secrets.RENDER_APP_URL }}/scrape/run"
 
       - name: Weekly notifications
         if: github.event.schedule == '0 5 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.job == 'notifications')
         run: |
           curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 300 \
-            -X POST "${{ vars.RENDER_APP_URL }}/notifications/generate"
+            -X POST "${{ secrets.RENDER_APP_URL }}/notifications/generate"
 
       - name: Weekly cleanup
         if: github.event.schedule == '0 2 * * 1' || (github.event_name == 'workflow_dispatch' && inputs.job == 'cleanup')
         run: |
           curl -sf --retry 3 --retry-delay 30 --retry-connrefused --max-time 300 \
-            -X DELETE "${{ vars.RENDER_APP_URL }}/signals/cleanup?days=30"
+            -X DELETE "${{ secrets.RENDER_APP_URL }}/signals/cleanup?days=30"
