@@ -158,12 +158,6 @@ def _scheduler_jobs() -> dict[str, SchedulerJob]:
     response_model=HealthResponse,
     summary="Full readiness check",
 )
-
-@router.head("/health", include_in_schema=False)
-async def health_head():
-    await health_check()
-    return Response(status_code=200)
-    
 async def health_check() -> HealthResponse:
     """Probe MongoDB + Gemini pool in parallel; aggregate overall status."""
     from main import DB_NAME, _gemini_clients
@@ -197,6 +191,9 @@ async def health_check() -> HealthResponse:
         scheduler    = _scheduler_jobs(),
     )
 
+@router.head("/health", include_in_schema=False)
+async def health_head():
+    return Response(status_code=status.HTTP_200_OK)
 
 @router.get("/livez", status_code=status.HTTP_200_OK, include_in_schema=False)
 async def liveness():
